@@ -6,7 +6,7 @@
 
 ### 第一步：创建 Worker
 
-请在 Cloudflare 后台创建一个 R2 存储桶 (Bucket)（例如命名为 nav-data）。
+请在 Cloudflare 后台创建一个 R2 存储桶 (Bucket)（例如命名为 nexus-nav-data ）。
 
 ### 第二步：创建R2 (存数据的地方)
 
