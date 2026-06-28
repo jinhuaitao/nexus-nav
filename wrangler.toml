@@ -1,0 +1,13 @@
+# 项目名称（在 Pages 中主要是标识作用）
+name = "nexus-nav"
+
+# 告诉 Cloudflare 你的输出目录就是根目录
+pages_build_output_dir = "."
+
+# 兼容性日期（填写当前日期即可）
+compatibility_date = "2024-05-01"
+
+# 🚀 核心魔法：自动绑定 R2 存储桶
+[[r2_buckets]]
+binding = "NAV_R2"                 # 必须与 _worker.js 代码里的 env.NAV_R2 严格一致
+bucket_name = "nexus-nav-data"     # 替换为你在第一步中实际创建的 R2 存储桶名称
