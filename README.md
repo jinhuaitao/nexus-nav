@@ -5,34 +5,36 @@
 ## 🚀 部署步骤
 
 ### 第一步：创建 Worker
-登录 Cloudflare Dashboard。
 
-在左侧菜单点击 Workers & Pages。
-
-点击 Create Application (创建应用) -> Create Worker (创建 Worker)。
-
-可以随便起个名字（比如 my-nav），然后点击 Deploy (部署)。
-
-此时你会看到一个默认的 "Hello World" 页面，不用管它。
-
-点击 Edit code (编辑代码)。
-
-清空 左侧编辑器里的所有默认代码，把上一条回复中的 完整 JS 代码 粘贴进去。
-
-点击右上角的 Deploy 保存。
-
-### 第二步：创建R2 (存数据的地方)
 请在 Cloudflare 后台创建一个 R2 存储桶 (Bucket)（例如命名为 nav-data）。
 
+### 第二步：创建R2 (存数据的地方)
 
+登录 Cloudflare 控制台，进入左侧导航栏的 Workers & Pages。
 
-### 第三步：绑定 R2 到 Worker (关键步骤！)
-在 Workers 的 Settings -> R2 Object Storage Buckets 中绑定该存储桶。
+点击 Create application（创建应用程序），然后选择 Pages 选项卡。
 
-关键： 绑定的变量名必须设为 NAV_R2
-填写配置（必须严格一致）：
+点击 Connect to Git（连接到 Git）。
 
-大功告成！ 点击 Worker 概览页面的 URL（通常是 https://你的名字.workers.dev）即可访问。
+选择你的 GitHub 账号，并选中你刚刚创建的 nexus-nav 仓库，点击 Begin setup（开始设置）。
+
+### 第三步：配置构建设置并初次部署
+
+在“Set up builds and deployments”页面，按以下方式配置：
+
+Project name (项目名称): 随意填写（例如 nexus-nav），这会成为你的免费二级域名。
+
+Production branch (生产分支): main 或 master。
+
+Framework preset (框架预设): 选择 None。
+
+Build command (构建命令): 留空（因为我们不需要打包）。
+
+Build output directory (构建输出目录): 填写 / （表示输出目录就是仓库根目录）。
+
+点击 Save and Deploy (保存并部署)。
+
+#### 大功告成！ 点击 Worker 概览页面的 URL（通常是 https://你的名字.workers.dev）即可访问。
 ## 第一次打开网站提示设置账号和密码
 
 ### 🔍 搜索沉浸模式 (Auto Zen)
