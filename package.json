@@ -1,0 +1,21 @@
+{
+  "name": "nexus-nav",
+  "version": "22.1.0",
+  "private": true,
+  "description": "Nexus 智能导航 · Cloudflare Worker + R2",
+  "scripts": {
+    "deploy": "node scripts/ensure-r2.mjs && wrangler deploy",
+    "dev": "wrangler dev",
+    "ensure-r2": "node scripts/ensure-r2.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "NAV_R2": {
+        "description": "自动创建并绑定的 R2 存储桶，用于保存导航数据与设置。无需手动创建。"
+      }
+    }
+  }
+}

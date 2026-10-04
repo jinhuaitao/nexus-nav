@@ -1,13 +1,20 @@
-# 项目名称（在 Pages 中主要是标识作用）
+# 项目名称
+# ⚠️ 必须与 Cloudflare 控制台里创建的 Worker 名称完全一致，否则构建会失败：
+#    "The name in your Wrangler configuration file must match the name of your Worker"
 name = "nexus-nav"
 
-# 告诉 Cloudflare 你的输出目录就是根目录
-pages_build_output_dir = "."
+# 🚀 Workers 入口文件
+# 根目录的 _worker.js 已经是标准 ES Module Worker 写法（export default { fetch }），
+# 不需要任何代码改动即可直接作为 Worker 运行。
+main = "_worker.js"
 
-# 兼容性日期（填写当前日期即可）
+# 兼容性日期
 compatibility_date = "2024-05-01"
 
-# 🚀 核心魔法：自动绑定 R2 存储桶
+# 🚀 核心：R2 存储桶绑定
+# 这里声明「我要绑定一个叫 nexus-nav-data 的桶到变量 NAV_R2」。
+# 桶本身由 scripts/ensure-r2.mjs 在部署前自动创建（已存在则跳过），
+# 因此控制台里不需要手动建桶、也不需要手动点绑定。
 [[r2_buckets]]
-binding = "NAV_R2"                 # 必须与 _worker.js 代码里的 env.NAV_R2 严格一致
-bucket_name = "nexus-nav-data"     # 替换为你在第一步中实际创建的 R2 存储桶名称
+binding = "NAV_R2"                 # 必须与 _worker.js 中的 env.NAV_R2 严格一致
+bucket_name = "nexus-nav-data"     # 如需改名，同时改 scripts/ensure-r2.mjs 的兜底默认值
