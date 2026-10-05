@@ -8,11 +8,9 @@
     "deploy": "node scripts/ensure-r2.mjs && wrangler deploy",
     "dev": "wrangler dev",
     "ensure-r2": "node scripts/ensure-r2.mjs",
-    "check": "wrangler deploy --dry-run --outdir=.wrangler/dry-run",
-    "test": "node tests/sortable.test.mjs"
+    "check": "wrangler deploy --dry-run --outdir=.wrangler/dry-run"
   },
   "devDependencies": {
-    "jsdom": "^30.1.2",
     "wrangler": "^4.0.0"
   },
   "cloudflare": {

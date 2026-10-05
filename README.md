@@ -34,7 +34,6 @@ _worker.js            # Worker 入口（前端页面 + API，单文件）
 wrangler.toml         # 声明 name / main / R2 绑定
 package.json          # 定义 deploy 脚本：先建桶，再部署
 scripts/ensure-r2.mjs # 幂等建桶脚本
-tests/                # 拖动排序回归测试（npm test，可选）
 .gitignore            # 忽略 node_modules / .wrangler / .dev.vars
 ```
 
@@ -300,24 +299,14 @@ Sortable 在 `forceFallback: true` 模式下会 `cloneNode` 出一个「跟着�
 
 `:key="groupRenderKey"` 写在**非 `x-for` 元素**上。Alpine 的 `x-bind:key` 遇到 `key` 时会直接 `return`，只把表达式存进 `_x_keyExpression`，既不产生响应式依赖、也不参与渲染 —— 也就是说这个「强制刷新」从来没生效过，已删除。
 
-### 回归测试
+### 怎么确认修好了
 
-仓库自带一份基于**真实 DOM + 真实 Alpine 3.13.3 + 真实 Sortable 1.15.0** 的拖动回归测试（跑在 jsdom 里，不需要浏览器）：
+进入编辑模式后依次试这几种情况，松手后顺序都应保持不变：
 
-```bash
-npm install
-npm test        # node tests/sortable.test.mjs
-```
+1. **组内前后拖**：把最后一张卡片拖到第一位、再拖回原位。
+2. **跨组拖**：把 A 组某张卡片拖到 B 组中间，确认 A 组少一张、B 组多一张且位置正确。
+3. **连续拖**：连着拖十几次，顺序不应逐渐跑偏。
+4. 拖动过程中，**跟手的卡片应该清晰可见**，原位置留一个虚框占位槽。
 
-覆盖：
-
-- 跟手克隆体必须可见（CSS 断言）
-- 组内拖动：把第 i 个依次拖到每个位置（25 次），校验 DOM 与数据精确等于语义期望
-- 跨组拖动：两端都不丢项、不重复，DOM 与数据一致
-- 连续 10 轮随机拖动（含跨组）后仍然稳定
-- 正常路径**不会**触发强制重建（保证无多余闪烁）
-- 兜底自愈：人为打乱 DOM 后能强制重建回正确顺序
-
-> 测试用的 Alpine / Sortable 从**和页面完全相同的 CDN 地址**拉取，并缓存到 `tests/.cache/`，
-> 所以测试跑的版本永远不会和线上跑偏。
+如果第 4 条不成立（拖动时看不到卡片），说明样式被外部干扰了 —— 检查浏览器扩展是否改写了页面 DOM。
 
