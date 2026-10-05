@@ -30,10 +30,11 @@
 确保仓库根目录包含：
 
 ```
-_worker.js            # Worker 入口（原样保留）
+_worker.js            # Worker 入口（前端页面 + API，单文件）
 wrangler.toml         # 声明 name / main / R2 绑定
 package.json          # 定义 deploy 脚本：先建桶，再部署
 scripts/ensure-r2.mjs # 幂等建桶脚本
+.gitignore            # 忽略 node_modules / .wrangler / .dev.vars
 ```
 
 ### 第二步：在控制台连接仓库
@@ -49,11 +50,11 @@ scripts/ensure-r2.mjs # 幂等建桶脚本
 | 配置项 | 填什么 |
 | --- | --- |
 | Worker 名称 | 必须与 `wrangler.toml` 里的 `name` **完全一致**（`nexus-nav`），否则构建会报 name mismatch |
-| **Build command**（构建命令） | 留空，或填 `exit 0` |
+| **Build command**（构建命令） | `npm install`（安装 wrangler 等依赖） |
 | **Deploy command**（部署命令） | `npm run deploy` ← **务必手动确认这一项**（控制台默认可能是 `npx wrangler deploy`，那样会跳过建桶） |
 | API token | 保持默认。Cloudflare 自动生成的令牌已包含 **Workers R2 Storage (edit)** 权限 |
 
-> 如果你更希望把建桶放在构建阶段，也可以：Build command 填 `node scripts/ensure-r2.mjs`，Deploy command 保持默认 `npx wrangler deploy`。
+> 如果你更希望把建桶放在构建阶段，也可以：Build command 填 `npm install && node scripts/ensure-r2.mjs`，Deploy command 保持默认 `npx wrangler deploy`。
 
 ### 第四步：Save and Deploy
 
@@ -134,14 +135,20 @@ A: 控制台里的 Worker 名称和 `wrangler.toml` 的 `name` 不一致，改�
 A: 点击搜索框并停留超过 3 秒自动进入禅模式，隐藏所有图标；点击背景空白处退出。
 
 **Q: 数据存在哪？会丢吗？**
-A: 全部存在 R2 的 `nav_data` / `nav_settings` / `admin_hash` 三个对象里。建议定期用「系统设置 → 备份」导出 JSON。
+A: 导航与设置存在 R2 的 `nav_data` / `nav_settings`，管理员凭据存在 `admin_hash`，登录会话存在 `session_*`（30 天过期）。建议定期用「系统设置 → 备份」导出 JSON。
 
 ---
 
-## 七、安全提示（建议后续加固）
+## 七、安全说明（v22.2 已加固）
 
-当前代码有几处可以改进的地方，不影响部署，但值得知道：
+以下问题在 v22.2 中已修复，此处保留说明便于回溯：
 
-1. **令牌强度**：登录后返回的 token 是 `base64(用户名 + 密码哈希)`，等价于把密码当令牌用。建议改为服务端生成随机 token 并存储。
-2. **SSRF**：`/api/meta` 会请求用户提交的任意 URL，建议加协议 + 域名白名单。
-3. **私有分组**：未登录访问时后端会过滤 `isPrivate` 的项，但「公开分组里的私有链接」在导出备份时会明文出现在 JSON 里，注意别把备份文件公开分享。
+1. **会话令牌**：旧版 token 是 `base64(用户名 + 密码哈希)`，等于把口令哈希当令牌用，且 `btoa()` 遇到中文用户名会直接抛错。现在改为**服务端生成的 64 位随机 token**，存 R2 的 `session_*` 对象，30 天过期，登出即吊销。
+2. **口令存储**：改为「随机盐 + SHA-256」，兼容旧数据（旧记录无 `salt` 时按原算法比对，登录后自动以新格式重存）。
+3. **SSRF**：`/api/meta` 现只放行 `http/https`，并拦截 `localhost`、`.local/.internal`、内网与保留地址段（10/8、127/8、169.254/16、172.16/12、192.168/16、100.64/10、IPv6 本地地址）。
+4. **私密内容外泄**：未登录读取 `/api/data` 时，除过滤 `isPrivate` 分组/链接外，**不再下发 `settings.memo`（便签）**。
+5. **反向标签劫持**：所有 `window.open` 外链已加 `noopener,noreferrer`。
+6. **响应头**：HTML 响应补充 `X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。
+
+> 仍需注意：**导出备份（系统设置 → 备份）会把私有链接以明文写进 JSON**，请勿公开分享备份文件。
+> 若需要多用户/更高强度，建议把口令哈希换成 `PBKDF2` 或 `bcrypt`，并给 `/api/login` 增加失败限流。

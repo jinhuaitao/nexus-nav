@@ -1,12 +1,14 @@
 {
   "name": "nexus-nav",
-  "version": "22.1.0",
+  "version": "22.2.0",
   "private": true,
+  "type": "module",
   "description": "Nexus 智能导航 · Cloudflare Worker + R2",
   "scripts": {
     "deploy": "node scripts/ensure-r2.mjs && wrangler deploy",
     "dev": "wrangler dev",
-    "ensure-r2": "node scripts/ensure-r2.mjs"
+    "ensure-r2": "node scripts/ensure-r2.mjs",
+    "check": "wrangler deploy --dry-run --outdir=.wrangler/dry-run"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

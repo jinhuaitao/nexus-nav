@@ -1,6 +1,20 @@
 /**
- * Cloudflare Worker Navigation Site v22.1 (Restore Fix Edition)
- * * Changelog:
+ * Cloudflare Worker Navigation Site v22.2 (Hardening & Consistency Edition)
+ *
+ * Changelog:
+ * - [SEC] 会话令牌改为服务端随机 token（R2 存储 + 30 天过期），不再把口令哈希当令牌用；
+ *         顺带修掉 btoa() 遇到中文用户名会抛 InvalidCharacterError 的问题。
+ * - [SEC] 口令哈希加盐（兼容旧数据：无 salt 时回退到原算法）。
+ * - [SEC] /api/meta 增加 SSRF 防护：仅放行 http/https，拦截 localhost / 内网 / 保留地址。
+ * - [SEC] 未登录读取 /api/data 时不再下发 settings.memo（便签属私密内容）。
+ * - [FIX] /api/meta 现在真正回传 og:image（原实现采集了 image 却只返回空 icon）。
+ * - [FIX] 顶部栏背景色 --card-rgb 之前未定义，导致 headerOpacity 调节无效。
+ * - [FIX] 图标透明度 --icon-opacity 之前只写不读，滑块无效果。
+ * - [FIX] sanitizeData 遇到缺失 items 的旧数据会抛错，现自动补齐。
+ * - [FIX] 外链统一加 noopener/noreferrer，避免反向标签劫持。
+ * - [SYNC] 版本号在 Worker 头部 / 页脚 / package.json 三处对齐。
+ *
+ * 历史（v22.1 Restore Fix Edition）:
  * - [FIX] "Reload Prompt": Fixed browser warning when restoring backup data.
  * - [FIX] "Drag Twice" Bug: Solved by removing Sortable animation delay and forcing Deep Clone updates.
  * - [FIX] "Snap Back": Uses immediate DOM-to-Data mapping on drop.
@@ -42,6 +56,7 @@ const HTML_TEMPLATE = (context) => `
             --card-bg: rgba(30, 41, 59, var(--card-opacity, 0.5));
             --card-hover: rgba(51, 65, 85, var(--hover-opacity, 0.7));
             --modal-bg: rgba(15, 23, 42, 0.85);
+            --card-rgb: 15, 23, 42;
             --icon-size: 32px;
         }
 
@@ -52,6 +67,7 @@ const HTML_TEMPLATE = (context) => `
             --card-bg: rgba(255, 255, 255, var(--card-opacity, 0.7));
             --card-hover: rgba(255, 255, 255, var(--hover-opacity, 0.95));
             --modal-bg: rgba(255, 255, 255, 0.9);
+            --card-rgb: 255, 255, 255;
         }
 
         body { 
@@ -92,7 +108,7 @@ const HTML_TEMPLATE = (context) => `
         .bg-layer { position: fixed; inset: 0; z-index: -10; background-size: cover; background-position: center; transition: opacity 0.5s; }
         video.bg-video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: -10; transition: opacity 0.5s; }
         .zen-hidden { opacity: 0; pointer-events: none; transform: translateY(20px); transition: all 0.5s ease; }
-        .link-icon { width: var(--icon-size); height: var(--icon-size); transition: transform 0.3s; object-fit: contain; }
+        .link-icon { width: var(--icon-size); height: var(--icon-size); transition: transform 0.3s, opacity 0.3s; object-fit: contain; opacity: var(--icon-opacity, 1); }
         .nav-card:hover .link-icon { transform: scale(1.15) rotate(3deg); }
         .group-content { transition: max-height 0.3s ease-out, opacity 0.2s; overflow: hidden; }
         .memo-area { resize: none; outline: none; border: none; background: transparent; font-family: inherit; line-height: 1.6; }
@@ -199,7 +215,7 @@ const HTML_TEMPLATE = (context) => `
         </div>
     </main>
     
-    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.0</a></footer>
+    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.2</a></footer>
 
     <div x-show="menu.show" :style="\`top: \${menu.y}px; left: \${menu.x}px\`" class="context-menu" @click.outside="closeMenu()" x-cloak>
         <div class="menu-item" @click="menuEdit()"><i class="fa-solid fa-pen w-4 opacity-60"></i> 编辑</div>
@@ -353,8 +369,10 @@ const HTML_TEMPLATE = (context) => `
                 sanitizeData(groups) {
                     let changed = false;
                     const idSet = new Set();
+                    if (!Array.isArray(groups)) return;
                     groups.forEach(g => {
                         if(!g.id) { g.id = 'g_'+Math.random().toString(36).substr(2,9); changed=true; }
+                        if(!Array.isArray(g.items)) { g.items = []; changed = true; }
                         g.items.forEach(i => {
                             if(!i.id || idSet.has(i.id)) {
                                 i.id = 'link_'+Math.random().toString(36).substr(2,9);
@@ -588,10 +606,10 @@ const HTML_TEMPLATE = (context) => `
                 async checkStatus() { try { const res = await fetch('/api/status'); this.needsSetup = !(await res.json()).setup; if(this.needsSetup) this.modals.login = true; } catch(e) {} },
                 async handleAuth() { this.status.submitting = true; const endpoint = this.needsSetup ? '/api/setup' : '/api/login'; try { const res = await fetch(endpoint, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(this.authForm) }); if(res.ok) { const data = await res.json(); this.token = data.token; localStorage.setItem('nexus_token', this.token); this.isLoggedIn = true; this.modals.login = false; this.needsSetup = false; this.syncData('GET'); this.showToast('欢迎回来'); setTimeout(() => { this.initGroupSortable(); this.updateSortableState(); }, 500); } else { this.showToast('验证失败', 'error'); } } catch(e) {} this.status.submitting = false; },
                 async verifyToken() { const res = await fetch('/api/check', { headers: { 'Authorization': this.token } }); if(!res.ok) this.logout(); else this.isLoggedIn = true; },
-                logout() { this.token = null; localStorage.removeItem('nexus_token'); this.isLoggedIn = false; this.editMode = false; this.groups = []; this.syncData('GET'); this.showToast('已登出'); },
+                logout() { try { if(this.token) fetch('/api/logout', { method: 'POST', headers: { 'Authorization': this.token } }); } catch(e) {} this.token = null; localStorage.removeItem('nexus_token'); this.isLoggedIn = false; this.editMode = false; this.groups = []; this.syncData('GET'); this.showToast('已登出'); },
 
-                doSearch() { if(!this.search) return; if(this.search.includes('.') && !this.search.includes(' ')) { window.open(this.search.startsWith('http') ? this.search : 'https://' + this.search, '_blank'); } else { let url = ''; if(this.settings.engine === 'custom' && this.settings.customSearchUrl) { url = this.settings.customSearchUrl; } else { const engine = this.engines.find(e => e.val === this.settings.engine) || this.engines[0]; url = engine.url; } window.open(url + encodeURIComponent(this.search), '_blank'); } },
-                getFavicon(url) { try { return \`https://icons.duckduckgo.com/ip3/\${new URL(url).hostname}.ico\`; } catch { return ''; } }, getDomain(url) { try { return new URL(url).hostname; } catch { return ''; } }, openLink(url) { window.open(url, '_blank'); }, showToast(msg, type='success') { this.toast.msg = msg; this.toast.type = type; this.toast.show = true; setTimeout(() => this.toast.show = false, 2500); },
+                doSearch() { if(!this.search) return; if(this.search.includes('.') && !this.search.includes(' ')) { window.open(this.search.startsWith('http') ? this.search : 'https://' + this.search, '_blank', 'noopener,noreferrer'); } else { let url = ''; if(this.settings.engine === 'custom' && this.settings.customSearchUrl) { url = this.settings.customSearchUrl; } else { const engine = this.engines.find(e => e.val === this.settings.engine) || this.engines[0]; url = engine.url; } window.open(url + encodeURIComponent(this.search), '_blank', 'noopener,noreferrer'); } },
+                getFavicon(url) { try { return \`https://icons.duckduckgo.com/ip3/\${new URL(url).hostname}.ico\`; } catch { return ''; } }, getDomain(url) { try { return new URL(url).hostname; } catch { return ''; } }, openLink(url) { window.open(url, '_blank', 'noopener,noreferrer'); }, showToast(msg, type='success') { this.toast.msg = msg; this.toast.type = type; this.toast.show = true; setTimeout(() => this.toast.show = false, 2500); },
                 exportData() { const blob = new Blob([JSON.stringify({ data: this.groups, settings: this.settings })], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = "nexus_backup.json"; a.click(); },
                 
                 // 🟢 FIXED: Prevent browser "Reload site?" prompt by clearing saving status
@@ -633,6 +651,58 @@ async function hashText(text) {
     const msgBuffer = new TextEncoder().encode(text);
     const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
     return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 🟢 会话：服务端随机令牌，存 R2，30 天过期。令牌本身不含任何口令信息。
+const SESSION_TTL = 30 * 24 * 60 * 60 * 1000;
+function randomHex(bytes = 32) {
+    const buf = new Uint8Array(bytes);
+    crypto.getRandomValues(buf);
+    return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function createSession(env, username) {
+    const raw = randomHex(32);
+    await env.NAV_R2.put('session_' + raw, JSON.stringify({ u: username, exp: Date.now() + SESSION_TTL }));
+    return 'Bearer ' + raw;
+}
+/** 校验用户名/口令；兼容旧数据（无 salt 时按原算法比对） */
+async function verifyCreds(env, username, password) {
+    const storedObj = await env.NAV_R2.get('admin_hash');
+    const stored = storedObj ? await storedObj.json() : null;
+    if (!stored || !stored.username || username !== stored.username) return null;
+    const hashed = stored.salt ? await hashText(stored.salt + password) : await hashText(password);
+    return hashed === stored.password ? stored : null;
+}
+async function revokeSession(env, header) {
+    if (header && header.startsWith('Bearer ')) {
+        const raw = header.slice(7);
+        if (/^[a-f0-9]{64}$/.test(raw)) await env.NAV_R2.delete('session_' + raw);
+    }
+}
+
+/** SSRF 防护：只放行 http/https，拦截 localhost / 内网 / 保留地址 */
+function isSafeTarget(rawUrl) {
+    let u;
+    try { u = new URL(rawUrl); } catch { return false; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (!host) return false;
+    if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') ||
+        host.endsWith('.internal') || host.endsWith('.home.arpa')) return false;
+    if (host.includes(':')) { // IPv6
+        if (host === '::1' || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80')) return false;
+        return true;
+    }
+    const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (m) {
+        const a = Number(m[1]), b = Number(m[2]);
+        if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
+        if (a === 169 && b === 254) return false;                 // link-local
+        if (a === 172 && b >= 16 && b <= 31) return false;        // 172.16/12
+        if (a === 192 && b === 168) return false;                 // 192.168/16
+        if (a === 100 && b >= 64 && b <= 127) return false;       // CGNAT 100.64/10
+    }
+    return true;
 }
 
 class MetaHandler {
@@ -677,7 +747,7 @@ export default {
             // Main UI Route
             if (path === "/" || path === "/index.html") {
                 const coords = { lat: request.cf?.latitude || null, lon: request.cf?.longitude || null };
-                return new Response(HTML_TEMPLATE({ coords }), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Frame-Options": "DENY" } });
+                return new Response(HTML_TEMPLATE({ coords }), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" } });
             }
             
             // --- R2 Storage Handlers ---
@@ -689,15 +759,20 @@ export default {
 
             if (path === "/api/meta") {
                 const targetUrl = url.searchParams.get("url"); if (!targetUrl) return new Response("Missing URL", { status: 400 });
+                if (!isSafeTarget(targetUrl)) return new Response(JSON.stringify({ error: "URL not allowed" }), { status: 400, headers: cors });
                 try {
                     const controller = new AbortController();
                     const timeoutId = setTimeout(() => controller.abort(), 3000);
                     const response = await fetch(targetUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusBot/11.0)' }, redirect: 'follow', signal: controller.signal });
                     clearTimeout(timeoutId);
-                    
+
                     const state = { title: null, description: null, image: null, inTitle: false };
                     await new HTMLRewriter().on("title", new MetaHandler(state)).on("meta", new MetaHandler(state)).transform(response).text();
-                    return new Response(JSON.stringify({ title: state.title ? state.title.trim() : "", description: state.description ? state.description.trim() : "", icon: "" }), { headers: cors });
+
+                    // og:image 可能是相对路径，解析为绝对地址后再回传
+                    let icon = state.image ? state.image.trim() : "";
+                    if (icon && !/^https?:/i.test(icon)) { try { icon = new URL(icon, targetUrl).href; } catch { icon = ""; } }
+                    return new Response(JSON.stringify({ title: state.title ? state.title.trim() : "", description: state.description ? state.description.trim() : "", icon }), { headers: cors });
                 } catch (e) { return new Response(JSON.stringify({ error: e.message }), { headers: cors }); }
             }
             
@@ -705,12 +780,20 @@ export default {
                 if (request.method === "GET") {
                     const dataObj = await env.NAV_R2.get("nav_data");
                     let data = dataObj ? await dataObj.json() : [];
-                    
+                    if (!Array.isArray(data)) data = [];
+
                     const settingsObj = await env.NAV_R2.get("nav_settings");
-                    const settings = settingsObj ? await settingsObj.json() : {};
-                    
+                    let settings = settingsObj ? await settingsObj.json() : {};
+                    if (!settings || typeof settings !== "object") settings = {};
+
                     const isAuth = await checkAuth(request, env);
-                    if (!isAuth && Array.isArray(data)) { data = data.filter(g => !g.isPrivate).map(g => ({ ...g, items: g.items.filter(i => !i.isPrivate) })); }
+                    if (!isAuth) {
+                        data = data.filter(g => g && !g.isPrivate)
+                                   .map(g => ({ ...g, items: Array.isArray(g.items) ? g.items.filter(i => !i.isPrivate) : [] }));
+                        // 便签属私密内容，未登录不下发
+                        const { memo, ...publicSettings } = settings;
+                        settings = publicSettings;
+                    }
                     return new Response(JSON.stringify({ data, settings }), { headers: cors });
                 }
                 if (request.method === "POST") {
@@ -725,23 +808,29 @@ export default {
             if (path === "/api/setup" && request.method === "POST") {
                 const existing = await env.NAV_R2.get("admin_hash");
                 if (existing) return new Response("Forbidden", { status: 403, headers: cors });
-                
-                const body = await request.json(); 
-                const hash = await hashText(body.password); 
-                const creds = { username: body.username, password: hash };
+
+                const body = await request.json();
+                if (!body || !body.username || !body.password) return new Response("Bad Request", { status: 400, headers: cors });
+                const salt = randomHex(16);
+                const creds = { username: body.username, salt, password: await hashText(salt + body.password) };
                 await env.NAV_R2.put("admin_hash", JSON.stringify(creds));
-                return new Response(JSON.stringify({ token: "Bearer " + btoa(JSON.stringify(creds)) }), { headers: cors });
+                const token = await createSession(env, creds.username);
+                return new Response(JSON.stringify({ token }), { headers: cors });
             }
 
             if (path === "/api/login" && request.method === "POST") {
-                const body = await request.json(); 
-                const storedObj = await env.NAV_R2.get("admin_hash");
-                const stored = storedObj ? await storedObj.json() : {};
-                
-                if (body.username === stored.username && (await hashText(body.password)) === stored.password) { 
-                    return new Response(JSON.stringify({ token: "Bearer " + btoa(JSON.stringify(stored)) }), { headers: cors }); 
+                const body = await request.json();
+                const stored = await verifyCreds(env, body?.username, body?.password);
+                if (stored) {
+                    const token = await createSession(env, stored.username);
+                    return new Response(JSON.stringify({ token }), { headers: cors });
                 }
                 return new Response("Unauthorized", { status: 401, headers: cors });
+            }
+
+            if (path === "/api/logout" && request.method === "POST") {
+                await revokeSession(env, request.headers.get("Authorization"));
+                return new Response("OK", { headers: cors });
             }
 
             if (path === "/api/check") { return (await checkAuth(request, env)) ? new Response("OK", { headers: cors }) : new Response("Unauthorized", { status: 401, headers: cors }); }
@@ -751,10 +840,15 @@ export default {
     }
 };
 
-async function checkAuth(req, env) { 
-    const h = req.headers.get("Authorization"); 
-    if (!h) return false; 
-    const storedObj = await env.NAV_R2.get("admin_hash");
-    const stored = storedObj ? await storedObj.json() : null;
-    return stored && h === "Bearer " + btoa(JSON.stringify(stored)); 
+async function checkAuth(req, env) {
+    const h = req.headers.get("Authorization");
+    if (!h || !h.startsWith("Bearer ")) return false;
+    const raw = h.slice(7);
+    if (!/^[a-f0-9]{64}$/.test(raw)) return false;
+    const obj = await env.NAV_R2.get("session_" + raw);
+    if (!obj) return false;
+    try {
+        const s = await obj.json();
+        return !!(s && s.exp && s.exp > Date.now());
+    } catch { return false; }
 }
