@@ -1,7 +1,18 @@
 /**
- * Cloudflare Worker Navigation Site v22.6 (Stable Drag Edition)
+ * Cloudflare Worker Navigation Site v22.7 (Autofill Off Edition)
  *
- * Changelog (v22.6):
+ * Changelog (v22.7):
+ * - [FIX]  顶部搜索框不再被浏览器自动填充：补齐 autocomplete / autocorrect / autocapitalize / spellcheck，
+ *          以及密码管理器的忽略标记（data-form-type / data-lpignore / data-1p-ignore）。
+ *          **刻意不加 name 属性** —— 浏览器的「表单历史」是按 (form, name) 记录的，
+ *          没有 name 就不会攒出那个「上次搜过什么」的下拉列表。
+ * - [FIX]  登录框的两个字段明确标注 autocomplete="username" / "current-password"。
+ *          登录弹窗其实一直在 DOM 里（只是 x-show 隐藏），浏览器容易把页面上的其它文本框
+ *          ——尤其是顶部搜索框——猜成「用户名」，然后把保存的账号填进去；标注清楚后就不会再猜。
+ * - [FEAT] 搜索框补 aria-label，并把移动端键盘的回车键改成「搜索」（inputmode / enterkeyhint）。
+ * - [SYNC] 版本号仍由 APP_VERSION 单一来源派生。
+ *
+ * Changelog (v22.6 Stable Drag Edition):
  * - [FIX]  「拖动时位置会乱」根因一：forceFallback 模式下 Sortable 会 cloneNode 出一个
  *          「跟随光标」的克隆体：ghostClass 加在【原元素】上，fallbackClass + dragClass 一起加在【克隆体】上。
  *          原来的 .sortable-drag { opacity: 0 !important } 把克隆体整个隐藏了（!important 还压过了
@@ -87,7 +98,7 @@
  */
 
 // 🟢 版本号单一来源：页脚、导出备份、Service Worker 缓存名都由它派生
-const APP_VERSION = "22.6";
+const APP_VERSION = "22.7";
 
 // 🟢 配置区域
 const SITE_ICON = "https://jhtvm.eu.org/rest/2Riuc1k.png"; 
@@ -297,7 +308,15 @@ const HTML_TEMPLATE = (context) => `
                 </template>
             </div>
             <div class="relative group transform transition-all duration-300 focus-within:scale-105">
-                <input x-ref="searchInput" type="text" x-model="search" @keydown.enter="doSearch()" @focus="startZenTimer()" @blur="clearZenTimer()" @input="onSearchInput()" :placeholder="getSearchPlaceholder()" class="search-input w-full h-14 pl-14 pr-14 rounded-2xl text-lg outline-none shadow-2xl backdrop-blur-md relative z-10">
+                <!-- 刻意不加 name 属性：浏览器的「表单历史」是按 (form, name) 记录的，没有 name 就不会攒历史下拉。
+                     其余属性是各家浏览器 / 密码管理器的关闭开关：
+                     autocomplete=off 通用；data-form-type/data-lpignore/data-1p-ignore 分别对应
+                     Dashlane / LastPass / 1Password，防止它们往这个输入框里注入自动填充图标。 -->
+                <input x-ref="searchInput" type="text"
+                       autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                       inputmode="search" enterkeyhint="search" aria-label="站内搜索"
+                       data-form-type="other" data-lpignore="true" data-1p-ignore
+                       x-model="search" @keydown.enter="doSearch()" @focus="startZenTimer()" @blur="clearZenTimer()" @input="onSearchInput()" :placeholder="getSearchPlaceholder()" class="search-input w-full h-14 pl-14 pr-14 rounded-2xl text-lg outline-none shadow-2xl backdrop-blur-md relative z-10">
                 <div class="absolute left-0 top-0 h-14 w-14 flex items-center justify-center opacity-40 pointer-events-none z-20"><i class="fa-solid fa-magnifying-glass text-lg"></i></div>
                 <div x-show="search" @click="search = ''; $refs.searchInput.focus()" class="absolute right-0 top-0 h-14 w-14 flex items-center justify-center opacity-40 cursor-pointer hover:opacity-100 transition z-20"><i class="fa-solid fa-times"></i></div>
             </div>
@@ -363,8 +382,10 @@ const HTML_TEMPLATE = (context) => `
             <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 to-purple-500"></div>
             <h2 class="text-xl font-bold mb-6 text-center" style="color: var(--text-primary)" x-text="needsSetup ? '初始化管理员' : '身份验证'"></h2>
             <form @submit.prevent="handleAuth">
-                <input type="text" x-model="authForm.username" placeholder="用户名" class="search-input w-full mb-3 p-3.5 rounded-xl text-center" required>
-                <input type="password" x-model="authForm.password" placeholder="密码" class="search-input w-full p-3.5 rounded-xl text-center" :class="tsCfg.enabled ? 'mb-4' : 'mb-8'" required>
+                <!-- 明确标注这两个字段的用途：浏览器一旦确认「凭据字段在这里」，
+                     就不会再把保存的账号密码猜着填到页面上的其它文本框（比如顶部搜索框）里去。 -->
+                <input type="text" x-model="authForm.username" autocomplete="username" placeholder="用户名" class="search-input w-full mb-3 p-3.5 rounded-xl text-center" required>
+                <input type="password" x-model="authForm.password" autocomplete="current-password" placeholder="密码" class="search-input w-full p-3.5 rounded-xl text-center" :class="tsCfg.enabled ? 'mb-4' : 'mb-8'" required>
                 <div x-show="tsCfg.enabled" class="mb-4">
                     <div x-ref="tsBox" class="flex justify-center min-h-[65px]"></div>
                     <p x-show="tsError" class="text-[11px] text-red-400 text-center mt-2 leading-relaxed" x-text="tsError"></p>
