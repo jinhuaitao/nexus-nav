@@ -1,5 +1,21 @@
 /**
- * Cloudflare Worker Navigation Site v22.7 (Autofill Off Edition)
+ * Cloudflare Worker Navigation Site v22.8 (Click Fix Edition)
+ *
+ * Changelog (v22.8 Click Fix Edition):
+ * - [FIX]  「点击登录按钮没有反应」：v22.7 把登录弹窗改成 x-if 按需渲染后引入的回归。
+ *          弹窗原本靠 @click.away 关闭，而 .away 会挂一个 document 级监听；
+ *          x-show 会把 el._x_isShown 管成 false，Alpine 的判定式「_x_isShown !== false」
+ *          因此在弹窗还没真正显示时短路，不会误关；但 x-if 插入的新节点 _x_isShown 是
+ *          undefined，判定式成立 —— 于是「打开弹窗的那一次点击」冒泡到 document 时，
+ *          被刚注册的 .away 监听当场捕获，弹窗开了又立刻被关掉，看起来就是点了没反应。
+ *          修法：全部弹窗改成「遮罩层 @click.self」，不再注册任何全局监听。
+ *          （@click.self 只认点到遮罩本身，行为与 .away 等价 —— 遮罩本来就是全屏的。）
+ * - [FIX]  x-transition 在 x-if 下是死代码：Alpine 只在 x-show 的路径里驱动过渡
+ *          （_x_toggleAndCascadeWithTransitions 是唯一的 .in() 调用点）。
+ *          两个按需渲染的弹窗改用纯 CSS 进场动画 .modal-pop（节点插入即播放）。
+ * - [NOTE] 这类时序 bug **jsdom 测不出来**：浏览器在每个事件监听器返回后都会做一次
+ *          微任务检查点，jsdom 不做。实测同一份代码 jsdom 全绿、真实 Chrome 里弹窗开不起来，
+ *          因此补了一套真实浏览器回归测试（见 README 第十一节）。
  *
  * Changelog (v22.7 Autofill Off Edition):
  * - [FIX]  「每次刷新账号被填进搜索框」的**根因**：登录弹窗原本用 x-show 隐藏，
@@ -110,7 +126,7 @@
  */
 
 // 🟢 版本号单一来源：页脚、导出备份、Service Worker 缓存名都由它派生
-const APP_VERSION = "22.7";
+const APP_VERSION = "22.8";
 
 // 🟢 配置区域
 const SITE_ICON = "https://jhtvm.eu.org/rest/2Riuc1k.png"; 
