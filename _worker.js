@@ -537,7 +537,7 @@ const HTML_TEMPLATE = (context) => `
                             <button @click="clearTurnstile()" x-show="ts.siteKeySet || ts.secretKeySet" class="px-3 py-2.5 rounded-lg bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white text-xs font-bold transition">清空</button>
                         </div>
                         <p x-show="ts.result" class="text-[11px] leading-relaxed p-2.5 rounded-lg bg-black/20 break-words" :class="ts.resultOk ? 'text-emerald-400' : 'text-amber-400'" x-text="ts.result"></p>
-                        <p class="text-[10px] leading-relaxed" style="color: var(--text-secondary)">密钥保存在 R2 的 <code>sys_settings</code>（<b>未加密</b>）；如更看重静态加密，可改用环境变量 <code>TURNSTILE_SITE_KEY</code> / <code>TURNSTILE_SECRET_KEY</code>。保存后<b>下次打开登录页生效</b>。若配错导致登不进去，可在控制台给 R2 加对象 <code>sys_turnstile_off = 1</code> 应急关闭。</p>
+                        <p class="text-[10px] leading-relaxed" style="color: var(--text-secondary)">密钥保存在 R2 的 <code>sys_settings</code>（<b>未加密</b>）；如更看重静态加密，可改用环境变量 <code>TURNSTILE_SITE_KEY</code> / <code>TURNSTILE_SECRET_KEY</code>。<b>保存后立即生效</b>（登录弹窗每次打开都会实时拉取配置，无需刷新页面）。若配错导致登不进去，可在控制台给 R2 加对象 <code>sys_turnstile_off = 1</code> 应急关闭。</p>
                     </div>
                 </div>
                 <div class="flex flex-col gap-3">
