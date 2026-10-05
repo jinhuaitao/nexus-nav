@@ -1,7 +1,21 @@
 /**
- * Cloudflare Worker Navigation Site v22.2 (Hardening & Consistency Edition)
+ * Cloudflare Worker Navigation Site v22.3 (Feature Completion Edition)
  *
- * Changelog:
+ * Changelog (v22.3):
+ * - [FEAT] 搜索框即时本地筛选：按分组名 / 标题 / 描述 / 网址过滤，原 getter 直接返回全部导致筛选形同虚设。
+ * - [FEAT] 补齐「自定义搜索引擎」：新增引擎选项 + 设置项 + 占位符提示，原 customSearchUrl 是永不生效的死代码。
+ * - [FEAT] 新建/编辑链接新增「所属分组」下拉，原实现无法在弹窗内改分组。
+ * - [FEAT] 未登录也可保存设置（localStorage），修复点引擎/调背景就弹「请先登录」的问题。
+ * - [FEAT] 书签导入按文件夹分组，原来把所有书签塞进一个 "Imported" 分组。
+ * - [FEAT] 空状态区分「无数据」与「搜索无结果」，并给搜索态加「清空搜索」按钮。
+ * - [FIX]  模板字符串内正则未双重转义，\\. 被吞成 . 导致 isVideoBg 正则非法（含 .mp4?token= 也识别为视频）。
+ * - [FIX]  筛选态禁用拖拽排序，避免在过滤后的子集上拖动产生错乱顺序。
+ * - [FIX]  Sortable 实例在 DOM 重建后未销毁导致累积，现自动回收已脱离 DOM 的实例。
+ * - [FIX]  剪贴板复制增加非安全上下文兜底；右键菜单定位增加下边界收敛。
+ * - [FIX]  Esc 清空搜索；主题切换同步更新 <meta theme-color>；天气显示补充描述 tooltip。
+ * - [SYNC] 版本号在 Worker 头部 / 页脚 / package.json 三处对齐。
+ *
+ * Changelog (v22.2 安全加固):
  * - [SEC] 会话令牌改为服务端随机 token（R2 存储 + 30 天过期），不再把口令哈希当令牌用；
  *         顺带修掉 btoa() 遇到中文用户名会抛 InvalidCharacterError 的问题。
  * - [SEC] 口令哈希加盐（兼容旧数据：无 salt 时回退到原算法）。
@@ -12,7 +26,6 @@
  * - [FIX] 图标透明度 --icon-opacity 之前只写不读，滑块无效果。
  * - [FIX] sanitizeData 遇到缺失 items 的旧数据会抛错，现自动补齐。
  * - [FIX] 外链统一加 noopener/noreferrer，避免反向标签劫持。
- * - [SYNC] 版本号在 Worker 头部 / 页脚 / package.json 三处对齐。
  *
  * 历史（v22.1 Restore Fix Edition）:
  * - [FIX] "Reload Prompt": Fixed browser warning when restoring backup data.
@@ -132,7 +145,7 @@ const HTML_TEMPLATE = (context) => `
                     <div class="font-bold text-lg tracking-tight leading-none mb-1 text-transparent bg-clip-text bg-gradient-to-r from-[var(--text-primary)] to-[var(--text-secondary)]">欢迎光临</div>
                     <div class="text-sm font-medium tracking-wide flex items-center gap-3 opacity-90" style="color: var(--text-secondary)">
                         <span x-text="timeStr"></span>
-                        <span x-show="weather.temp" class="flex items-center gap-2 bg-white/10 px-3 py-1 rounded-lg ml-1 border border-white/10 shadow-sm transition-colors hover:bg-white/15 cursor-default group">
+                        <span x-show="weather.temp" :title="weather.desc" class="flex items-center gap-2 bg-white/10 px-3 py-1 rounded-lg ml-1 border border-white/10 shadow-sm transition-colors hover:bg-white/15 cursor-default group">
                             <img :src="weather.icon" class="w-5 h-5 object-contain" x-show="weather.icon"><span x-text="weather.temp + '°'" class="font-bold"></span>
                         </span>
                     </div>
@@ -170,7 +183,7 @@ const HTML_TEMPLATE = (context) => `
                 </template>
             </div>
             <div class="relative group transform transition-all duration-300 focus-within:scale-105">
-                <input x-ref="searchInput" type="text" x-model="search" @keydown.enter="doSearch()" @focus="startZenTimer()" @blur="clearZenTimer()" @input="clearZenTimer()" :placeholder="getSearchPlaceholder()" class="search-input w-full h-14 pl-14 pr-14 rounded-2xl text-lg outline-none shadow-2xl backdrop-blur-md relative z-10">
+                <input x-ref="searchInput" type="text" x-model="search" @keydown.enter="doSearch()" @focus="startZenTimer()" @blur="clearZenTimer()" @input="onSearchInput()" :placeholder="getSearchPlaceholder()" class="search-input w-full h-14 pl-14 pr-14 rounded-2xl text-lg outline-none shadow-2xl backdrop-blur-md relative z-10">
                 <div class="absolute left-0 top-0 h-14 w-14 flex items-center justify-center opacity-40 pointer-events-none z-20"><i class="fa-solid fa-magnifying-glass text-lg"></i></div>
                 <div x-show="search" @click="search = ''; $refs.searchInput.focus()" class="absolute right-0 top-0 h-14 w-14 flex items-center justify-center opacity-40 cursor-pointer hover:opacity-100 transition z-20"><i class="fa-solid fa-times"></i></div>
             </div>
@@ -211,11 +224,11 @@ const HTML_TEMPLATE = (context) => `
             </template>
         </div>
         <div x-show="filteredGroups.length === 0 && !zenMode" class="text-center py-20 opacity-40">
-            <div x-cloak><i class="fa-brands fa-space-awesome text-6xl mb-6 animate-pulse"></i><p class="text-sm tracking-wide">你的数字宇宙空空如也</p><button x-show="isLoggedIn" @click="openGroupModal()" class="mt-6 px-6 py-2 rounded-full bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600 hover:text-white transition text-sm font-bold">开始构建</button></div>
+            <div x-cloak><i class="fa-brands fa-space-awesome text-6xl mb-6 animate-pulse"></i><p class="text-sm tracking-wide" x-text="searchHint"></p><button x-show="isLoggedIn && !search" @click="openGroupModal()" class="mt-6 px-6 py-2 rounded-full bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600 hover:text-white transition text-sm font-bold">开始构建</button><button x-show="search" @click="search=''; updateSortableState(); $refs.searchInput.focus()" class="mt-6 px-6 py-2 rounded-full bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600 hover:text-white transition text-sm font-bold">清空搜索</button></div>
         </div>
     </main>
     
-    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.2</a></footer>
+    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.3</a></footer>
 
     <div x-show="menu.show" :style="\`top: \${menu.y}px; left: \${menu.x}px\`" class="context-menu" @click.outside="closeMenu()" x-cloak>
         <div class="menu-item" @click="menuEdit()"><i class="fa-solid fa-pen w-4 opacity-60"></i> 编辑</div>
@@ -251,6 +264,7 @@ const HTML_TEMPLATE = (context) => `
                 <div class="relative"><input type="text" x-model="linkForm.url" @blur="fetchMetadata()" placeholder="https://" class="search-input w-full p-3 pl-10 rounded-xl" :class="{'border-indigo-500': status.fetchingMeta}"><i class="fa-solid fa-globe absolute left-3.5 top-3.5 opacity-40"></i><div x-show="status.fetchingMeta" class="absolute right-3 top-3.5 text-indigo-400 animate-spin"><i class="fa-solid fa-circle-notch"></i></div></div>
                 <input type="text" x-model="linkForm.title" placeholder="标题 (自动获取)" class="search-input w-full p-3 rounded-xl">
                 <input type="text" x-model="linkForm.desc" placeholder="描述 (可选)" class="search-input w-full p-3 rounded-xl">
+                <div class="relative"><select x-model="linkForm.groupId" class="search-input w-full p-3 pl-10 rounded-xl appearance-none cursor-pointer" style="background-color: var(--modal-bg)"><template x-for="g in groups" :key="g.id"><option :value="g.id" x-text="g.name"></option></template></select><i class="fa-solid fa-folder absolute left-3.5 top-3.5 opacity-40 pointer-events-none"></i><i class="fa-solid fa-chevron-down absolute right-3.5 top-3.5 opacity-40 pointer-events-none text-xs"></i></div>
                 <div class="flex gap-3"><div class="flex-1 relative"><input type="text" x-model="linkForm.iconUrl" placeholder="图标 URL" class="search-input w-full p-3 pl-9 rounded-xl text-sm"><img :src="linkForm.iconUrl || 'about:blank'" class="absolute left-2.5 top-2.5 w-5 h-5 rounded object-contain opacity-50" onerror="this.style.display='none'" onload="this.style.display='block'"></div><div class="flex items-center justify-center px-4 rounded-xl cursor-pointer border transition select-none" :class="linkForm.isPrivate ? 'border-amber-500/50 bg-amber-500/10 text-amber-500' : 'border-gray-500/20 bg-gray-500/5 text-gray-400'" @click="linkForm.isPrivate = !linkForm.isPrivate" title="隐私模式"><i class="fa-solid" :class="linkForm.isPrivate ? 'fa-lock' : 'fa-lock-open'"></i></div></div>
             </div>
             <div class="mt-8 flex gap-3"><button @click="modals.link = false" class="flex-1 py-3 rounded-xl bg-gray-500/10 hover:bg-gray-500/20 transition font-medium" style="color: var(--text-secondary)">取消</button><button @click="saveLink()" class="flex-1 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold shadow-lg shadow-indigo-500/20">保存</button></div>
@@ -299,6 +313,11 @@ const HTML_TEMPLATE = (context) => `
                         <div class="flex items-center justify-between"><span class="text-xs" style="color: var(--text-secondary)">浅色模式保留壁纸</span><div class="relative inline-block w-9 h-5 align-middle select-none transition duration-200 ease-in"><input type="checkbox" id="bg-toggle" x-model="settings.showBgInLight" class="absolute block w-5 h-5 rounded-full bg-white border-4 appearance-none cursor-pointer transition-all duration-300" :class="settings.showBgInLight ? 'right-0 border-indigo-500' : 'right-4 border-gray-300'"/><label for="bg-toggle" class="block overflow-hidden h-5 rounded-full cursor-pointer transition-colors" :class="settings.showBgInLight ? 'bg-indigo-500' : 'bg-gray-300'"></label></div></div>
                     </div>
                 </div>
+                <div class="p-4 rounded-xl bg-gray-500/5 border border-gray-500/10">
+                    <label class="text-xs font-bold uppercase tracking-wider mb-3 block opacity-50" style="color: var(--text-secondary)">自定义搜索引擎</label>
+                    <input type="text" x-model="settings.customSearchUrl" placeholder="https://www.example.com/search?q=" class="search-input w-full p-2.5 rounded-lg text-xs mb-2">
+                    <p class="text-[10px] leading-relaxed" style="color: var(--text-secondary)">填写搜索地址前缀，关键词会自动拼接在末尾。在顶部搜索栏选择「自定义」引擎后生效。</p>
+                </div>
                 <div class="flex flex-col gap-3">
                      <label class="w-full py-3 rounded-xl bg-orange-500/10 hover:bg-orange-500/20 text-orange-500 text-xs font-bold text-center cursor-pointer transition border border-orange-500/20"><i class="fa-brands fa-chrome mr-1"></i> 导入 Chrome/Edge 书签<input type="file" class="hidden" accept=".html" @change="importBookmarks($event)"></label>
                     <div class="flex gap-3"><button @click="exportData()" class="flex-1 py-3 rounded-xl bg-blue-500/10 hover:bg-blue-500/20 text-blue-500 text-xs font-bold transition border border-blue-500/20"><i class="fa-solid fa-download mr-1"></i> 备份</button><label class="flex-1 py-3 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 text-xs font-bold text-center cursor-pointer transition border border-emerald-500/20"><i class="fa-solid fa-upload mr-1"></i> 恢复<input type="file" class="hidden" accept=".json" @change="importData($event)"></label></div>
@@ -329,7 +348,8 @@ const HTML_TEMPLATE = (context) => `
                     { name: 'Google', val: 'google', icon: 'fa-brands fa-google', url: 'https://www.google.com/search?q=' },
                     { name: 'Bing', val: 'bing', icon: 'fa-brands fa-microsoft', url: 'https://www.bing.com/search?q=' },
                     { name: 'Baidu', val: 'baidu', icon: 'fa-solid fa-paw', url: 'https://www.baidu.com/s?wd=' },
-                    { name: 'Duck', val: 'duck', icon: 'fa-solid fa-duck', url: 'https://duckduckgo.com/?q=' }
+                    { name: 'Duck', val: 'duck', icon: 'fa-solid fa-duck', url: 'https://duckduckgo.com/?q=' },
+                    { name: '自定义', val: 'custom', icon: 'fa-solid fa-wand-magic-sparkles', url: '' }
                 ],
                 authForm: { username: '', password: '' }, linkForm: { id: null, groupId: null, title: '', url: '', desc: '', iconUrl: '', isPrivate: false }, groupForm: { id: null, name: '', isPrivate: false },
                 
@@ -340,6 +360,8 @@ const HTML_TEMPLATE = (context) => `
                 groupRenderKey: Date.now(), 
 
                 async init() {
+                    // 未登录用户的设置保存在本地，先加载再被服务端设置覆盖（仅登录态）
+                    try { const s = JSON.parse(localStorage.getItem('nexus_settings') || 'null'); if (s && typeof s === 'object') this.settings = { ...this.settings, ...s }; } catch(e) {}
                     setInterval(() => { const now = new Date(); this.timeStr = now.toLocaleDateString() + ' ' + now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }, 1000);
                     this.fetchWeather(); 
                     await Promise.all([this.checkStatus(), this.syncData('GET')]);
@@ -385,9 +407,15 @@ const HTML_TEMPLATE = (context) => `
                 },
 
                 handleKeydown(e) {
-                    if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') { if (e.key === 'Escape') { document.activeElement.blur(); this.closeAllModals(); } return; }
+                    if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') {
+                        if (e.key === 'Escape') {
+                            if (document.activeElement === this.$refs.searchInput && this.search) { this.search = ''; this.updateSortableState(); }
+                            document.activeElement.blur(); this.closeAllModals();
+                        }
+                        return;
+                    }
                     if (e.key === '/') { e.preventDefault(); this.$refs.searchInput.focus(); }
-                    if (e.key === 'Escape') { this.closeAllModals(); this.zenMode = false; if(this.editMode) this.toggleEditMode(); }
+                    if (e.key === 'Escape') { this.closeAllModals(); this.zenMode = false; if(this.search){ this.search = ''; this.updateSortableState(); } if(this.editMode) this.toggleEditMode(); }
                     if (e.key === 'Z' && e.shiftKey) { this.toggleZen(); }
                     if (e.key === 'N' && e.shiftKey && this.isLoggedIn) { this.modals.memo = true; }
                 },
@@ -402,13 +430,20 @@ const HTML_TEMPLATE = (context) => `
                 },
 
                 updateSortableState() {
-                    const isDisabled = !this.editMode;
+                    const isDisabled = !this.editMode || !!this.search;
                     if (this.groupSortableInstance) this.groupSortableInstance.option('disabled', isDisabled);
-                    this.sortableInstances.forEach(inst => inst.option('disabled', isDisabled));
+                    // 顺带清理已从 DOM 移除的实例，避免筛选/重建后实例无限累积
+                    this.sortableInstances = this.sortableInstances.filter(inst => {
+                        const el = inst && inst.el;
+                        if (!el || !el.isConnected) { try { inst.destroy(); } catch(e) {} return false; }
+                        inst.option('disabled', isDisabled);
+                        return true;
+                    });
                 },
 
                 startZenTimer() { if (this.zenMode || this.search) return; this.clearZenTimer(); this.zenTimer = setTimeout(() => { if (!this.zenMode && !this.search && document.activeElement === this.$refs.searchInput) { this.zenMode = true; } }, 3000); },
                 clearZenTimer() { if (this.zenTimer) { clearTimeout(this.zenTimer); this.zenTimer = null; } },
+                onSearchInput() { this.clearZenTimer(); this.updateSortableState(); },
 
                 setEngine(val) { this.settings.engine = val; this.saveSettings(); },
 
@@ -449,12 +484,27 @@ const HTML_TEMPLATE = (context) => `
                     document.documentElement.style.setProperty('--card-opacity', cardOp);
                     document.documentElement.style.setProperty('--hover-opacity', Math.min(cardOp + 0.3, 1));
                 },
-                toggleTheme() { this.theme = this.theme === 'dark' ? 'light' : 'dark'; localStorage.setItem('theme', this.theme); },
+                toggleTheme() { this.theme = this.theme === 'dark' ? 'light' : 'dark'; localStorage.setItem('theme', this.theme); const m = document.querySelector('meta[name="theme-color"]'); if(m) m.setAttribute('content', this.theme === 'light' ? '#f8fafc' : '#0f172a'); },
 
-                get filteredGroups() { return this.groups; },
+                // 🟢 搜索框即时本地筛选（分组名 / 标题 / 描述 / 网址），原实现直接返回全部导致筛选失效
+                get filteredGroups() {
+                    const q = (this.search || '').trim().toLowerCase();
+                    if (!q) return this.groups;
+                    const hit = (s) => String(s == null ? '' : s).toLowerCase().includes(q);
+                    return this.groups.map(g => {
+                        const groupHit = hit(g.name);
+                        const items = (g.items || []).filter(i => groupHit || hit(i.title) || hit(i.desc) || hit(i.url));
+                        return { ...g, items };
+                    }).filter(g => g.items.length > 0);
+                },
+                get searchHint() { return (this.search || '').trim() ? '没有匹配的结果，按回车可去搜索引擎查找' : '你的数字宇宙空空如也'; },
                 get bgUrl() { if (this.settings.bgType === 'custom' && this.settings.customBg && !this.isVideoBg) return this.settings.customBg; return 'https://bing.biturl.top/?resolution=1920&format=image&index=0&mkt=zh-CN'; },
-                get isVideoBg() { return this.settings.bgType === 'custom' && this.settings.customBg && this.settings.customBg.endsWith('.mp4'); },
-                getSearchPlaceholder() { if (this.settings.engine === 'custom') return 'Search with Custom Engine...'; return 'Search with ' + (this.engines.find(e => e.val === this.settings.engine)?.name || 'Google') + '...'; },
+                get isVideoBg() { return this.settings.bgType === 'custom' && !!this.settings.customBg && /\\.(mp4|webm|ogg|mov)(\\?.*)?$/i.test(this.settings.customBg); },
+                getSearchPlaceholder() {
+                    const e = this.engines.find(x => x.val === this.settings.engine) || this.engines[0];
+                    if (e.val === 'custom') return this.settings.customSearchUrl ? '使用自定义引擎搜索...' : '请先在「系统设置」填写自定义搜索地址';
+                    return 'Search with ' + e.name + '...';
+                },
 
                 initGroupSortable() { 
                     const el = document.getElementById('groups-container'); if(!el) return;
@@ -523,10 +573,11 @@ const HTML_TEMPLATE = (context) => `
                     this.sortableInstances.push(inst);
                 },
 
-                showContextMenu(e, link, groupId) { if(!this.editMode) return; this.menu.targetLink = link; this.menu.targetGroupId = groupId; let x = e.clientX, y = e.clientY; if (window.innerWidth - x < 180) x -= 170; this.menu.x = x; this.menu.y = y; this.menu.show = true; },
+                showContextMenu(e, link, groupId) { if(!this.editMode) return; this.menu.targetLink = link; this.menu.targetGroupId = groupId; let x = e.clientX, y = e.clientY; if (window.innerWidth - x < 190) x -= 180; if (window.innerHeight - y < 160) y -= 150; this.menu.x = Math.max(4, x); this.menu.y = Math.max(4, y); this.menu.show = true; },
                 closeMenu() { this.menu.show = false; },
                 menuEdit() { this.linkForm = { ...this.menu.targetLink, groupId: this.menu.targetGroupId }; this.modals.link = true; this.closeMenu(); },
-                menuCopy() { navigator.clipboard.writeText(this.menu.targetLink.url); this.showToast('链接已复制'); this.closeMenu(); },
+                menuCopy() { const url = this.menu.targetLink && this.menu.targetLink.url; if(!url) { this.closeMenu(); return; } const done = () => { this.showToast('链接已复制'); this.closeMenu(); }; if(navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(url).then(done).catch(() => { this.copyFallback(url); done(); }); } else { this.copyFallback(url); done(); } },
+                copyFallback(text) { try { const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.focus(); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); } catch(e) {} },
                 async deleteLink(linkId, groupId) { if(!confirm('确定删除?')) return; const group = this.groups.find(g => String(g.id) === String(groupId)); if(group) { group.items = group.items.filter(i => String(i.id) !== String(linkId)); await this.saveAll(); this.modals.link = false; this.closeMenu(); this.showToast('已删除'); } },
 
                 openLinkModal(groupId = null) { const defaultGroup = groupId || (this.groups.length > 0 ? this.groups[0].id : null); if(!defaultGroup && !groupId) return this.showToast('请先创建分组', 'error'); this.linkForm = { id: null, groupId: defaultGroup, title: '', url: '', desc: '', iconUrl: '', isPrivate: false }; this.modals.link = true; },
@@ -587,7 +638,7 @@ const HTML_TEMPLATE = (context) => `
                 },
                 deleteGroup() { if(!confirm('删除此分组及所有内容?')) return; this.groups = this.groups.filter(x => String(x.id) !== String(this.groupForm.id)); this.saveAll(); this.modals.group = false; },
 
-                async syncData(method, payload = null) { const headers = { 'Content-Type': 'application/json' }; if(this.token) headers['Authorization'] = this.token; if(method === 'POST') this.status.saving = true; try { const res = await fetch('/api/data', { method, headers, body: payload ? JSON.stringify(payload) : null }); if(res.status === 401) { this.logout(); return; } if(method === 'GET') { const data = await res.json(); this.groups = (Array.isArray(data.data) && data.data.length > 0 && !data.data[0].items) ? [{ id: 'default', name: 'Home', items: data.data }] : (data.data || []); if(data.settings) { this.settings = { ...this.settings, ...data.settings }; this.updateCSSVars(); } this.sanitizeData(this.groups); } else { this.status.pending = false; } } catch(e) { if(method === 'POST') this.status.pending = true; } finally { this.status.saving = false; } },
+                async syncData(method, payload = null) { const headers = { 'Content-Type': 'application/json' }; if(this.token) headers['Authorization'] = this.token; if(method === 'POST') this.status.saving = true; try { const res = await fetch('/api/data', { method, headers, body: payload ? JSON.stringify(payload) : null }); if(res.status === 401) { this.logout(); return; } if(method === 'GET') { const data = await res.json(); const raw = Array.isArray(data.data) ? data.data : []; this.groups = (raw.length > 0 && raw[0] && !raw[0].items) ? [{ id: 'default', name: 'Home', isPrivate: false, items: raw }] : raw; if(data.settings && this.token) { this.settings = { ...this.settings, ...data.settings }; this.updateCSSVars(); } this.sanitizeData(this.groups); } else { this.status.pending = false; } } catch(e) { if(method === 'POST') this.status.pending = true; } finally { this.status.saving = false; } },
                 
                 saveAll() { 
                     if(this.isLoggedIn) { 
@@ -598,8 +649,9 @@ const HTML_TEMPLATE = (context) => `
                             this.status.pending = false;
                             this.saveDebounceTimer = null;
                         }, 500); 
-                    } else if(this.settings.engine === 'custom') { 
-                        this.showToast('请先登录', 'error'); 
+                    } else {
+                        // 未登录：设置（主题/背景/布局/引擎等）本地生效，不再报「请先登录」
+                        try { localStorage.setItem('nexus_settings', JSON.stringify(this.settings)); } catch(e) {}
                     }
                 }, 
                 async saveSettings() { await this.saveAll(); },
@@ -608,7 +660,16 @@ const HTML_TEMPLATE = (context) => `
                 async verifyToken() { const res = await fetch('/api/check', { headers: { 'Authorization': this.token } }); if(!res.ok) this.logout(); else this.isLoggedIn = true; },
                 logout() { try { if(this.token) fetch('/api/logout', { method: 'POST', headers: { 'Authorization': this.token } }); } catch(e) {} this.token = null; localStorage.removeItem('nexus_token'); this.isLoggedIn = false; this.editMode = false; this.groups = []; this.syncData('GET'); this.showToast('已登出'); },
 
-                doSearch() { if(!this.search) return; if(this.search.includes('.') && !this.search.includes(' ')) { window.open(this.search.startsWith('http') ? this.search : 'https://' + this.search, '_blank', 'noopener,noreferrer'); } else { let url = ''; if(this.settings.engine === 'custom' && this.settings.customSearchUrl) { url = this.settings.customSearchUrl; } else { const engine = this.engines.find(e => e.val === this.settings.engine) || this.engines[0]; url = engine.url; } window.open(url + encodeURIComponent(this.search), '_blank', 'noopener,noreferrer'); } },
+                doSearch() {
+                    const q = (this.search || '').trim();
+                    if (!q) return;
+                    if (q.includes('.') && !q.includes(' ')) { window.open(q.startsWith('http') ? q : 'https://' + q, '_blank', 'noopener,noreferrer'); return; }
+                    const engine = this.engines.find(e => e.val === this.settings.engine) || this.engines[0];
+                    let base = engine.url;
+                    if (engine.val === 'custom' && this.settings.customSearchUrl) base = this.settings.customSearchUrl;
+                    if (!base) { this.showToast('请先在「系统设置」填写自定义搜索地址', 'error'); return; }
+                    window.open(base + encodeURIComponent(q), '_blank', 'noopener,noreferrer');
+                },
                 getFavicon(url) { try { return \`https://icons.duckduckgo.com/ip3/\${new URL(url).hostname}.ico\`; } catch { return ''; } }, getDomain(url) { try { return new URL(url).hostname; } catch { return ''; } }, openLink(url) { window.open(url, '_blank', 'noopener,noreferrer'); }, showToast(msg, type='success') { this.toast.msg = msg; this.toast.type = type; this.toast.show = true; setTimeout(() => this.toast.show = false, 2500); },
                 exportData() { const blob = new Blob([JSON.stringify({ data: this.groups, settings: this.settings })], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = "nexus_backup.json"; a.click(); },
                 
@@ -639,7 +700,34 @@ const HTML_TEMPLATE = (context) => `
                     reader.readAsText(file); 
                 },
                 
-                importBookmarks(e) { const file = e.target.files[0]; if (!file) return; const reader = new FileReader(); reader.onload = async (ev) => { const html = ev.target.result; const parser = new DOMParser(); const doc = parser.parseFromString(html, "text/html"); const links = Array.from(doc.querySelectorAll('a')); if(links.length === 0) return this.showToast('未找到书签', 'error'); const newGroup = { id: Date.now().toString(), name: 'Imported', isPrivate: false, items: links.map(a => ({ id: Math.random().toString(36).substr(2, 9), title: a.textContent, url: a.href, iconUrl: a.getAttribute('icon'), isPrivate: false })) }; this.groups.push(newGroup); await this.saveAll(); this.showToast(\`导入 \${links.length} 个书签\`); }; reader.readAsText(file); }
+                importBookmarks(e) {
+                    const file = e.target.files[0]; if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = async (ev) => {
+                        const doc = new DOMParser().parseFromString(ev.target.result, 'text/html');
+                        const mkItem = (a) => ({ id: Math.random().toString(36).substr(2, 9), title: (a.textContent || '').trim() || a.href, url: a.href, iconUrl: a.getAttribute('icon') || '', isPrivate: false });
+                        const newGroups = [];
+                        // 按书签文件夹分组；只取该文件夹「直接子级」链接，排除嵌套子文件夹
+                        Array.from(doc.querySelectorAll('h3')).forEach(h3 => {
+                            const dl = h3.nextElementSibling;
+                            if (!dl || dl.tagName !== 'DL') return;
+                            const anchors = Array.from(dl.querySelectorAll('a')).filter(a => a.closest('dl') === dl);
+                            if (!anchors.length) return;
+                            newGroups.push({ id: 'g_' + Math.random().toString(36).substr(2, 9), name: (h3.textContent || '').trim() || 'Imported', isPrivate: false, items: anchors.map(mkItem) });
+                        });
+                        if (!newGroups.length) {
+                            const anchors = Array.from(doc.querySelectorAll('a'));
+                            if (!anchors.length) return this.showToast('未找到书签', 'error');
+                            newGroups.push({ id: 'g_' + Math.random().toString(36).substr(2, 9), name: 'Imported', isPrivate: false, items: anchors.map(mkItem) });
+                        }
+                        const total = newGroups.reduce((n, g) => n + g.items.length, 0);
+                        this.groups.push(...newGroups);
+                        await this.saveAll();
+                        this.$nextTick(() => { this.initGroupSortable(); this.updateSortableState(); });
+                        this.showToast(\`导入 \${newGroups.length} 个分组 / \${total} 个书签\`);
+                    };
+                    reader.readAsText(file);
+                }
             }
         }
     </script>
