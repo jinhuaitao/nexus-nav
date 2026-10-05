@@ -9,7 +9,8 @@
  *          视觉上就是「全乱」。现在克隆体保持不透明，原位置的占位槽用虚框高亮。
  * - [FIX]  「拖动时位置会乱」根因二：Alpine x-for 的重排算法隐含前提是
  *          「真实 DOM 顺序 == 它内部记录的 _x_prevKeys」。Sortable 已经先在 DOM 上搬好了卡片，
- *          x-for 会从这个不一致的状态出发去算交换序列，实测约 40% 的排列会被算错。
+ *          x-for 会从这个不一致的状态出发去算交换序列，从而把顺序算错
+ *          （回归测试里随机拖 11 次有 6 次被改错）。
  *          现在组内拖动结束后主动把 _x_prevKeys 同步成新顺序，让 x-for 零操作、DOM 保持正确；
  *          跨组拖动则交给 x-for 原生的「移除 + 新增」路径（它会重建卡片并修正作用域链）。
  * - [FIX]  新增 verifyGridOrder / verifyGroupOrder 兜底：每次拖放后在 $nextTick 真实比对
@@ -759,8 +760,8 @@ const HTML_TEMPLATE = (context) => `
                 // 🟢 排序稳定性的关键
                 // Alpine 的 x-for 重排算法有一个隐含前提：真实 DOM 的顺序 == 它内部记录的 _x_prevKeys。
                 // Sortable 已经在 DOM 上把卡片搬好了，如果我们放任不管，x-for 会从一个「不一致」的
-                // 状态出发去计算交换序列，从而把顺序算错（实测约 40% 的排列会被改错，这正是
-                // 「拖动时位置会乱」的第二个根因）。
+                // 状态出发去计算交换序列，从而把顺序算错（回归测试里随机拖 11 次，有 6 次被改错，
+                // 这正是「拖动时位置会乱」的第二个根因）。
                 // 组内拖动时元素没有被搬去别的分组、作用域链也没变，所以最干净的做法是直接告诉
                 // Alpine「你已经是最新顺序了」——它会零操作，DOM 就保持 Sortable 摆好的正确顺序。
                 syncXForKeys(gridEl, groupId, orderedIds) {
@@ -771,10 +772,10 @@ const HTML_TEMPLATE = (context) => `
                     return true;
                 },
 
-                // 兜底校验：Alpine 的 x-for 依赖内部 _x_lookup/_x_prevKeys 重排，
-                // 当 Sortable 直接在 DOM 上搬动过节点后，绝大多数情况 x-for 会自动纠正；
-                // 这里做一次真实比对，一旦发现 DOM 与数据不一致，就提升该分组的渲染版本号，
-                // 让 x-for 的 key 全部失效并整块重建，保证顺序 100% 正确。
+                // 兜底校验：上面两条路径已经把顺序做对了，但 Alpine 的内部字段毕竟不是公开契约。
+                // 这里在 $nextTick 里把真实 DOM 顺序与数据顺序逐一比对，只要对不上就提升该分组的
+                // 渲染版本号，让 x-for 的 key 全部失效并整块重建 —— 用一次重建换 100% 正确。
+                // 正常路径下这个分支不会触发（回归测试断言了这一点）。
                 verifyGridOrder(groupIds) {
                     this.$nextTick(() => {
                         const seen = new Set();
