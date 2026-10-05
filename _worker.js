@@ -1,7 +1,20 @@
 /**
- * Cloudflare Worker Navigation Site v22.4 (Polish Edition)
+ * Cloudflare Worker Navigation Site v22.5 (Turnstile Edition)
  *
- * Changelog (v22.4):
+ * Changelog (v22.5):
+ * - [FEAT] 人机验证（Cloudflare Turnstile）：Site Key / Secret Key 可在「系统设置」内配置，
+ *          存 R2 的 sys_settings；未配置时自动回退环境变量 TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY。
+ * - [FEAT] 容错设计：只对「非请求方原因」（密钥无效、验证服务不可达）降级放行并给出醒目告警；
+ *          用户自己没通过验证仍照常拦截（含缺失 token、token 过期/重复）。严格 / 宽松两档可选。
+ * - [FEAT] 应急开关：控制台写 R2 对象 sys_turnstile_off 即可关闭验证，避免配错后把管理员锁在门外。
+ * - [FEAT] 自检端点 GET /api/turnstile/diagnose（无需登录、按 IP 限流），返回
+ *          not-configured / emergency-off / secret-invalid / secret-ok / unreachable 五种结论与修复建议，绝不回显密钥明文。
+ * - [FEAT] 登录页组件用显式渲染 + 错误码中文提示；密钥仅以掩码回显；设置页拦截「两把密钥填反」。
+ * - [SEC] 设置接口需登录；成对校验（只配一半直接 400）；密钥字段语义为「不传=不改，显式空串=清空」。
+ * - [SEC] 验证失败也计入登录限流，避免用「不带 token 的请求」反复触发探针。
+ * - [SYNC] 版本号在 Worker 头部 / 页脚 / package.json 三处对齐。
+ *
+ * Changelog (v22.4 Polish Edition):
  * - [FEAT] PWA Service Worker：新增 /sw.js，仅对白名单 CDN 做「网络优先 + 缓存兜底」，
  *          同源 HTML / API 一律不拦截、绝不缓存，避免读到过期内容或他人数据。
  * - [SEC] 登录失败限流：同一 IP 10 分钟内失败 8 次即临时锁定（429），登录成功后清零。
@@ -170,7 +183,8 @@ const HTML_TEMPLATE = (context) => `
         .memo-area { resize: none; outline: none; border: none; background: transparent; font-family: inherit; line-height: 1.6; }
         ::-webkit-scrollbar { width: 0px; }
     </style>
-    <script>window.CF_COORDS = ${JSON.stringify(context.coords)};</script>
+    <script>window.CF_COORDS = ${JSON.stringify(context.coords)};window.TURNSTILE_CFG = ${JSON.stringify(context.turnstile || { enabled: false, siteKey: '', mode: 'strict' })};window.onTurnstileApiLoad = function () { window.__tsApiReady = true; };</script>
+    ${(context.turnstile && context.turnstile.enabled) ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileApiLoad" async defer></script>' : ''}
 </head>
 <body x-data="app()" :class="{ 'light-theme': theme === 'light', 'editing': editMode }" @click="closeMenu()" @keydown.window="handleKeydown($event)" @contextmenu.prevent>
 
@@ -199,7 +213,7 @@ const HTML_TEMPLATE = (context) => `
                 <div x-show="status.pending && !status.saving" class="flex items-center gap-2 text-amber-400 bg-amber-500/10 px-2 py-1 rounded-md border border-amber-500/20"><i class="fa-solid fa-cloud-arrow-up text-xs animate-pulse"></i><span class="text-[10px] font-bold">待保存</span></div>
                 <button @click="toggleTheme()" class="btn-icon w-10 h-10 rounded-xl flex items-center justify-center shadow-sm hover:bg-white/5 transition"><i class="fa-solid transition-transform duration-500" :class="theme === 'dark' ? 'fa-moon' : 'fa-sun -rotate-90'"></i></button>
                 <button @click="toggleZen()" class="btn-icon w-10 h-10 rounded-xl flex items-center justify-center shadow-sm hover:bg-white/5 transition"><i class="fa-solid fa-leaf"></i></button>
-                <template x-if="!isLoggedIn"><button @click="modals.login = true" class="btn-icon w-10 h-10 rounded-xl flex items-center justify-center shadow-sm hover:bg-white/5 transition"><i class="fa-solid fa-user-astronaut"></i></button></template>
+                <template x-if="!isLoggedIn"><button @click="openLogin()" class="btn-icon w-10 h-10 rounded-xl flex items-center justify-center shadow-sm hover:bg-white/5 transition"><i class="fa-solid fa-user-astronaut"></i></button></template>
                 <template x-if="isLoggedIn">
                     <div class="relative" x-data="{ open: false }">
                         <button @click.stop="open = !open" class="w-10 h-10 rounded-xl bg-gradient-to-r from-indigo-600 to-blue-600 text-white shadow-lg shadow-indigo-500/30 flex items-center justify-center hover:scale-105 transition active:scale-95 ring-1 ring-white/20"><i class="fa-solid fa-bars"></i></button>
@@ -208,7 +222,7 @@ const HTML_TEMPLATE = (context) => `
                             <div class="h-px bg-white/10 my-1"></div>
                             <div @click="modals.memo = true" class="menu-item"><i class="fa-solid fa-note-sticky w-5 opacity-70"></i> 快速便签</div>
                             <div @click="openGroupModal()" class="menu-item"><i class="fa-solid fa-folder-plus w-5 opacity-70"></i> 新建分组</div>
-                            <div @click="modals.settings = true" class="menu-item"><i class="fa-solid fa-sliders w-5 opacity-70"></i> 系统设置</div>
+                            <div @click="openSettings()" class="menu-item"><i class="fa-solid fa-sliders w-5 opacity-70"></i> 系统设置</div>
                             <div class="h-px bg-white/10 my-1"></div>
                             <div @click="logout()" class="menu-item danger text-red-400"><i class="fa-solid fa-power-off w-5"></i> 安全退出</div>
                         </div>
@@ -219,6 +233,11 @@ const HTML_TEMPLATE = (context) => `
     </nav>
 
     <main class="mx-auto px-4 sm:px-6 pb-24 transition-all duration-500" :class="[settings.layoutWidth === 'wide' ? 'max-w-[98%]' : 'max-w-7xl', zenMode ? 'mt-[30vh]' : '']">
+        <div x-show="tsWarning && !zenMode" x-cloak class="max-w-3xl mx-auto mb-6 px-4 py-3 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-start gap-2.5">
+            <i class="fa-solid fa-triangle-exclamation text-amber-500 mt-0.5"></i>
+            <span class="flex-1 text-[12px] leading-relaxed text-amber-500 break-words" x-text="tsWarning"></span>
+            <button @click="dismissTsWarning()" class="text-amber-500/60 hover:text-amber-500 transition shrink-0"><i class="fa-solid fa-times text-xs"></i></button>
+        </div>
         <div class="max-w-2xl mx-auto mb-12 relative z-10 animate-fade-in-up">
             <div class="flex justify-center flex-wrap gap-2 mb-4 transition-opacity duration-300" :class="{ 'opacity-0': zenMode }">
                 <template x-for="eng in engines">
@@ -271,7 +290,7 @@ const HTML_TEMPLATE = (context) => `
         </div>
     </main>
     
-    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.4</a></footer>
+    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.5</a></footer>
 
     <div x-show="menu.show" :style="\`top: \${menu.y}px; left: \${menu.x}px\`" class="context-menu" @click.outside="closeMenu()" x-cloak>
         <div class="menu-item" @click="menuEdit()"><i class="fa-solid fa-pen w-4 opacity-60"></i> 编辑</div>
@@ -294,7 +313,11 @@ const HTML_TEMPLATE = (context) => `
             <h2 class="text-xl font-bold mb-6 text-center" style="color: var(--text-primary)" x-text="needsSetup ? '初始化管理员' : '身份验证'"></h2>
             <form @submit.prevent="handleAuth">
                 <input type="text" x-model="authForm.username" placeholder="用户名" class="search-input w-full mb-3 p-3.5 rounded-xl text-center" required>
-                <input type="password" x-model="authForm.password" placeholder="密码" class="search-input w-full mb-8 p-3.5 rounded-xl text-center" required>
+                <input type="password" x-model="authForm.password" placeholder="密码" class="search-input w-full p-3.5 rounded-xl text-center" :class="tsCfg.enabled ? 'mb-4' : 'mb-8'" required>
+                <div x-show="tsCfg.enabled" class="mb-4">
+                    <div x-ref="tsBox" class="flex justify-center min-h-[65px]"></div>
+                    <p x-show="tsError" class="text-[11px] text-red-400 text-center mt-2 leading-relaxed" x-text="tsError"></p>
+                </div>
                 <button type="submit" class="w-full py-3.5 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold shadow-lg shadow-indigo-500/20 transition transform active:scale-95 disabled:opacity-50" :disabled="status.submitting"><span x-show="!status.submitting" x-text="needsSetup ? '系统初始化' : '登录控制台'"></span><span x-show="status.submitting"><i class="fa-solid fa-circle-notch fa-spin"></i></span></button>
             </form>
         </div>
@@ -361,6 +384,36 @@ const HTML_TEMPLATE = (context) => `
                     <input type="text" x-model="settings.customSearchUrl" placeholder="https://www.example.com/search?q=" class="search-input w-full p-2.5 rounded-lg text-xs mb-2">
                     <p class="text-[10px] leading-relaxed" style="color: var(--text-secondary)">填写搜索地址前缀，关键词会自动拼接在末尾。在顶部搜索栏选择「自定义」引擎后生效。</p>
                 </div>
+                <div class="p-4 rounded-xl bg-gray-500/5 border border-gray-500/10">
+                    <div class="flex items-center justify-between mb-3">
+                        <label class="text-xs font-bold uppercase tracking-wider opacity-50" style="color: var(--text-secondary)">人机验证 (Turnstile)</label>
+                        <span class="text-[10px] px-2 py-0.5 rounded-full border" :class="ts.badgeClass" x-text="ts.badgeText"></span>
+                    </div>
+                    <div class="space-y-3">
+                        <div>
+                            <div class="flex justify-between text-xs mb-1.5" style="color: var(--text-secondary)"><span>Site Key</span><span x-show="ts.siteKeySet" class="font-mono" x-text="ts.siteKeyMasked"></span></div>
+                            <input type="text" x-model="ts.form.siteKey" :placeholder="ts.siteKeySet ? '已配置（留空则不修改）' : '0x4AAA...'" class="search-input w-full p-2.5 rounded-lg text-xs font-mono">
+                        </div>
+                        <div>
+                            <div class="flex justify-between text-xs mb-1.5" style="color: var(--text-secondary)"><span>Secret Key</span><span x-show="ts.secretKeySet" class="font-mono" x-text="ts.secretKeyMasked"></span></div>
+                            <input type="password" x-model="ts.form.secretKey" :placeholder="ts.secretKeySet ? '已配置（留空则不修改）' : '0x4AAA...'" class="search-input w-full p-2.5 rounded-lg text-xs font-mono">
+                        </div>
+                        <div class="flex items-center justify-between">
+                            <span class="text-xs" style="color: var(--text-secondary)">容错模式</span>
+                            <div class="flex gap-2">
+                                <button @click="ts.form.mode = 'strict'" class="px-3 py-1.5 rounded-lg text-[11px] font-medium border transition" :class="ts.form.mode === 'strict' ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-gray-500/20'" style="color: var(--text-secondary)">严格</button>
+                                <button @click="ts.form.mode = 'lenient'" class="px-3 py-1.5 rounded-lg text-[11px] font-medium border transition" :class="ts.form.mode === 'lenient' ? 'bg-amber-600 border-amber-600 text-white' : 'border-gray-500/20'" style="color: var(--text-secondary)">宽松</button>
+                            </div>
+                        </div>
+                        <div class="flex gap-2">
+                            <button @click="saveTurnstile()" class="flex-1 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition">保存验证配置</button>
+                            <button @click="diagnoseTurnstile()" class="px-3 py-2.5 rounded-lg bg-gray-500/10 hover:bg-gray-500/20 text-xs font-bold transition" style="color: var(--text-secondary)">自检</button>
+                            <button @click="clearTurnstile()" x-show="ts.siteKeySet || ts.secretKeySet" class="px-3 py-2.5 rounded-lg bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white text-xs font-bold transition">清空</button>
+                        </div>
+                        <p x-show="ts.result" class="text-[11px] leading-relaxed p-2.5 rounded-lg bg-black/20 break-words" :class="ts.resultOk ? 'text-emerald-400' : 'text-amber-400'" x-text="ts.result"></p>
+                        <p class="text-[10px] leading-relaxed" style="color: var(--text-secondary)">密钥保存在 R2 的 <code>sys_settings</code>（<b>未加密</b>）；如更看重静态加密，可改用环境变量 <code>TURNSTILE_SITE_KEY</code> / <code>TURNSTILE_SECRET_KEY</code>。保存后<b>下次打开登录页生效</b>。若配错导致登不进去，可在控制台给 R2 加对象 <code>sys_turnstile_off = 1</code> 应急关闭。</p>
+                    </div>
+                </div>
                 <div class="flex flex-col gap-3">
                      <label class="w-full py-3 rounded-xl bg-orange-500/10 hover:bg-orange-500/20 text-orange-500 text-xs font-bold text-center cursor-pointer transition border border-orange-500/20"><i class="fa-brands fa-chrome mr-1"></i> 导入 Chrome/Edge 书签<input type="file" class="hidden" accept=".html" @change="importBookmarks($event)"></label>
                     <div class="flex gap-3"><button @click="exportData()" class="flex-1 py-3 rounded-xl bg-blue-500/10 hover:bg-blue-500/20 text-blue-500 text-xs font-bold transition border border-blue-500/20"><i class="fa-solid fa-download mr-1"></i> 备份</button><label class="flex-1 py-3 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 text-xs font-bold text-center cursor-pointer transition border border-emerald-500/20"><i class="fa-solid fa-upload mr-1"></i> 恢复<input type="file" class="hidden" accept=".json" @change="importData($event)"></label></div>
@@ -398,6 +451,10 @@ const HTML_TEMPLATE = (context) => `
                 toast: { show: false, msg: '', type: 'success' },
                 toastTimer: null,
                 confirmBox: { show: false, title: '', message: '', okText: '确认', danger: true, onOk: null },
+                tsCfg: (window.TURNSTILE_CFG || { enabled: false, siteKey: '', mode: 'strict' }),
+                turnstileToken: '', tsError: '', tsWidgetId: null, tsPollTimer: null,
+                tsWarning: (function () { try { return sessionStorage.getItem('nexus_ts_warning') || ''; } catch (e) { return ''; } })(),
+                ts: { form: { siteKey: '', secretKey: '', mode: 'strict' }, siteKeySet: false, secretKeySet: false, siteKeyMasked: '', secretKeyMasked: '', source: 'none', enabled: false, emergencyOff: false, result: '', resultOk: true, badgeText: '未配置', badgeClass: 'border-gray-500/30 text-gray-400' },
                 settings: { bgType: 'bing', customBg: '', blur: 0, engine: 'google', customSearchUrl: '', showBgInLight: false, iconSize: 32, layoutWidth: 'center', iconOpacity: 100, cardOpacity: 40, headerOpacity: 75, memo: '' },
                 engines: [
                     { name: 'Google', val: 'google', icon: 'fa-brands fa-google', url: 'https://www.google.com/search?q=' },
@@ -712,8 +769,34 @@ const HTML_TEMPLATE = (context) => `
                     }
                 }, 
                 async saveSettings() { await this.saveAll(); },
-                async checkStatus() { try { const res = await fetch('/api/status'); this.needsSetup = !(await res.json()).setup; if(this.needsSetup) this.modals.login = true; } catch(e) {} },
-                async handleAuth() { this.status.submitting = true; const endpoint = this.needsSetup ? '/api/setup' : '/api/login'; try { const res = await fetch(endpoint, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(this.authForm) }); if(res.ok) { const data = await res.json(); this.token = data.token; localStorage.setItem('nexus_token', this.token); this.isLoggedIn = true; this.modals.login = false; this.needsSetup = false; this.authForm.password = ''; this.syncData('GET'); this.showToast('欢迎回来'); setTimeout(() => { this.initGroupSortable(); this.updateSortableState(); }, 500); } else if (res.status === 429) { this.showToast('尝试次数过多，请稍后再试', 'error'); this.authForm.password = ''; } else if (res.status === 403) { this.showToast('系统已初始化，请直接登录', 'error'); this.needsSetup = false; } else { this.showToast('用户名或密码错误', 'error'); this.authForm.password = ''; } } catch(e) { this.showToast('网络异常，请稍后重试', 'error'); } this.status.submitting = false; },
+                async checkStatus() { try { const res = await fetch('/api/status'); this.needsSetup = !(await res.json()).setup; if(this.needsSetup) { this.modals.login = true; this.$nextTick(() => this.renderTurnstile()); } } catch(e) {} },
+                async handleAuth() {
+                    this.status.submitting = true;
+                    const endpoint = this.needsSetup ? '/api/setup' : '/api/login';
+                    const payload = { ...this.authForm, cfToken: this.turnstileToken, cfError: this.tsError };
+                    try {
+                        const res = await fetch(endpoint, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+                        if(res.ok) {
+                            const data = await res.json();
+                            this.token = data.token; localStorage.setItem('nexus_token', this.token);
+                            this.isLoggedIn = true; this.modals.login = false; this.needsSetup = false; this.authForm.password = '';
+                            if (data.warning) { this.tsWarning = data.warning; try { sessionStorage.setItem('nexus_ts_warning', data.warning); } catch(e) {} this.showToast('人机验证已临时放行，请检查配置', 'error'); }
+                            else this.showToast('欢迎回来');
+                            this.syncData('GET');
+                            setTimeout(() => { this.initGroupSortable(); this.updateSortableState(); }, 500);
+                        } else if (res.status === 429) {
+                            this.showToast('尝试次数过多，请稍后再试', 'error'); this.authForm.password = ''; this.resetTurnstile();
+                        } else if (res.status === 403) {
+                            const d = await res.json().catch(() => ({}));
+                            if (d.error === 'turnstile_failed') this.showToast('人机验证未通过，请重新完成验证', 'error');
+                            else { this.showToast('系统已初始化，请直接登录', 'error'); this.needsSetup = false; }
+                            this.authForm.password = ''; this.resetTurnstile();
+                        } else {
+                            this.showToast('用户名或密码错误', 'error'); this.authForm.password = ''; this.resetTurnstile();
+                        }
+                    } catch(e) { this.showToast('网络异常，请稍后重试', 'error'); }
+                    this.status.submitting = false;
+                },
                 async verifyToken() { const res = await fetch('/api/check', { headers: { 'Authorization': this.token } }); if(!res.ok) this.logout('登录已过期，请重新登录'); else this.isLoggedIn = true; },
                 logout(msg = '已登出') { try { if(this.token) fetch('/api/logout', { method: 'POST', headers: { 'Authorization': this.token } }); } catch(e) {} this.token = null; localStorage.removeItem('nexus_token'); this.isLoggedIn = false; this.editMode = false; this.groups = []; this.syncData('GET'); this.showToast(msg); },
 
@@ -732,6 +815,93 @@ const HTML_TEMPLATE = (context) => `
                 showToast(msg, type='success') { this.toast.msg = msg; this.toast.type = type; this.toast.show = true; if (this.toastTimer) clearTimeout(this.toastTimer); this.toastTimer = setTimeout(() => { this.toast.show = false; }, 2500); },
                 askConfirm(message, onOk, opts = {}) { this.confirmBox = { show: true, title: opts.title || '请确认', message, okText: opts.okText || '确认', danger: opts.danger !== false, onOk }; },
                 doConfirm() { const fn = this.confirmBox.onOk; this.confirmBox.show = false; if (typeof fn === 'function') fn(); },
+
+                // 🟢 Turnstile：登录页组件渲染 / 重置
+                openLogin() { this.modals.login = true; this.$nextTick(() => this.renderTurnstile()); },
+                tsHint(code) { const m = { '110100': 'Site Key 无效或格式错误', '400020': 'Site Key 无效或填反了（Site Key / Secret Key 不要互换）', '110110': 'Site Key 不存在或不属于当前账号', '110200': '当前域名未在 widget 的 Hostname Management 中授权（workers.dev 需显式添加）', '400021': '域名与 Site Key 不匹配', '110500': '组件模式不匹配（应为 Managed）', '110600': '验证超时，请刷新重试', '400070': 'Site Key 已停用' }; return '人机验证组件异常：' + (m[String(code)] || ('错误码 ' + code)); },
+                renderTurnstile() {
+                    if (!this.tsCfg.enabled || !this.tsCfg.siteKey) return;
+                    const el = this.$refs.tsBox;
+                    if (!el) return;
+                    if (!(window.turnstile && window.turnstile.render)) {
+                        if (this.tsPollTimer) return;
+                        let tries = 0;
+                        this.tsPollTimer = setInterval(() => {
+                            tries++;
+                            if (window.turnstile && window.turnstile.render) { clearInterval(this.tsPollTimer); this.tsPollTimer = null; this.renderTurnstile(); }
+                            else if (tries > 50) { clearInterval(this.tsPollTimer); this.tsPollTimer = null; this.tsError = '验证组件加载失败：可能被广告拦截插件或网络策略拦截，请检查后重试。'; }
+                        }, 200);
+                        return;
+                    }
+                    if (this.tsWidgetId !== null) { try { window.turnstile.reset(this.tsWidgetId); return; } catch (e) { /* 重新渲染 */ } }
+                    try {
+                        this.tsWidgetId = window.turnstile.render(el, {
+                            sitekey: this.tsCfg.siteKey,
+                            theme: this.theme === 'light' ? 'light' : 'dark',
+                            callback: (t) => { this.turnstileToken = t; this.tsError = ''; },
+                            'error-callback': (c) => { this.tsError = this.tsHint(c); },
+                            'timeout-callback': () => { this.tsError = this.tsHint('110600'); },
+                            'expired-callback': () => { this.turnstileToken = ''; },
+                        });
+                    } catch (e) { this.tsError = '验证组件初始化失败，请刷新页面重试。'; }
+                },
+                resetTurnstile() { this.turnstileToken = ''; this.tsError = ''; try { if (window.turnstile && this.tsWidgetId !== null) window.turnstile.reset(this.tsWidgetId); } catch (e) {} },
+                dismissTsWarning() { this.tsWarning = ''; try { sessionStorage.removeItem('nexus_ts_warning'); } catch (e) {} },
+
+                // 🟢 Turnstile：设置页配置
+                openSettings() { this.modals.settings = true; this.loadTurnstile(); },
+                computeTsBadge() {
+                    if (this.ts.emergencyOff) { this.ts.badgeText = '已应急关闭'; this.ts.badgeClass = 'border-red-500/30 text-red-400'; return; }
+                    if (this.ts.enabled) { this.ts.badgeText = this.ts.source === 'env' ? '已启用（环境变量）' : '已启用'; this.ts.badgeClass = 'border-emerald-500/30 text-emerald-400'; return; }
+                    if (this.ts.siteKeySet || this.ts.secretKeySet) { this.ts.badgeText = '配置不完整'; this.ts.badgeClass = 'border-amber-500/30 text-amber-400'; return; }
+                    this.ts.badgeText = '未配置'; this.ts.badgeClass = 'border-gray-500/30 text-gray-400';
+                },
+                async loadTurnstile() {
+                    try {
+                        const res = await fetch('/api/settings/turnstile', { headers: { 'Authorization': this.token } });
+                        if (!res.ok) return;
+                        const d = await res.json();
+                        this.ts.siteKeySet = !!d.siteKeySet; this.ts.secretKeySet = !!d.secretKeySet;
+                        this.ts.siteKeyMasked = d.siteKeyMasked || ''; this.ts.secretKeyMasked = d.secretKeyMasked || '';
+                        this.ts.source = d.source || 'none'; this.ts.emergencyOff = !!d.emergencyOff; this.ts.enabled = !!d.enabled;
+                        this.ts.form.siteKey = ''; this.ts.form.secretKey = '';
+                        this.ts.form.mode = d.mode === 'lenient' ? 'lenient' : 'strict';
+                        this.computeTsBadge();
+                    } catch (e) {}
+                },
+                async saveTurnstile() {
+                    const f = this.ts.form;
+                    const site = (f.siteKey || '').trim(), secret = (f.secretKey || '').trim();
+                    if (site && secret && site === secret) return this.showToast('Site Key 与 Secret Key 不能相同（很可能填反了）', 'error');
+                    const body = { mode: f.mode };
+                    if (site) body.siteKey = site;
+                    if (secret) body.secretKey = secret;
+                    try {
+                        const res = await fetch('/api/settings/turnstile', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': this.token }, body: JSON.stringify(body) });
+                        const d = await res.json().catch(() => ({}));
+                        if (!res.ok) return this.showToast(d.message || '保存失败', 'error');
+                        await this.loadTurnstile();
+                        this.showToast('已保存，下次打开登录页生效');
+                    } catch (e) { this.showToast('网络异常，请稍后重试', 'error'); }
+                },
+                clearTurnstile() { this.askConfirm('将同时清空 Site Key 与 Secret Key，登录将不再进行人机验证。', async () => {
+                    try {
+                        const res = await fetch('/api/settings/turnstile', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': this.token }, body: JSON.stringify({ siteKey: '', secretKey: '' }) });
+                        const d = await res.json().catch(() => ({}));
+                        if (!res.ok) return this.showToast(d.message || '操作失败', 'error');
+                        await this.loadTurnstile(); this.showToast('已清空验证配置');
+                    } catch (e) { this.showToast('网络异常', 'error'); }
+                }, { okText: '清空' }); },
+                async diagnoseTurnstile() {
+                    this.ts.result = '检测中…'; this.ts.resultOk = true;
+                    try {
+                        const res = await fetch('/api/turnstile/diagnose');
+                        const d = await res.json().catch(() => ({}));
+                        if (res.status === 429) { this.ts.resultOk = false; this.ts.result = d.message || '检测过于频繁，请稍后再试'; return; }
+                        this.ts.resultOk = d.conclusion === 'secret-ok' || d.conclusion === 'not-configured';
+                        this.ts.result = (d.conclusionText || '未知') + '：' + (d.advice || '') + ((d.codes && d.codes.length) ? '（' + d.codes.join(', ') + '）' : '');
+                    } catch (e) { this.ts.resultOk = false; this.ts.result = '自检请求失败，请检查网络。'; }
+                },
                 exportData() { const blob = new Blob([JSON.stringify({ version: 'v22.4', exportedAt: new Date().toISOString(), data: this.groups, settings: this.settings }, null, 2)], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'nexus_backup_' + new Date().toISOString().slice(0, 10) + '.json'; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch(e) {} }, 1000); this.showToast('备份已导出'); },
                 resetSettings() { this.askConfirm('将把背景 / 布局 / 外观等设置恢复为默认值（不会删除任何链接），确定继续？', () => { this.settings = { ...this.settings, bgType: 'bing', customBg: '', blur: 0, engine: 'google', customSearchUrl: '', showBgInLight: false, iconSize: 32, layoutWidth: 'center', iconOpacity: 100, cardOpacity: 40, headerOpacity: 75 }; this.updateCSSVars(); this.saveAll(); this.showToast('已恢复默认设置'); }, { okText: '恢复默认', danger: false }); },
                 
@@ -864,6 +1034,105 @@ async function recordLoginFail(env, ip) {
 }
 async function clearLoginFails(env, ip) { if (ip) await env.NAV_R2.delete('login_fail_' + ip); }
 
+/** 通用计数限流：窗口期内超过 limit 次即拒绝 */
+async function bumpRate(env, key, limit, windowMs) {
+    let state = { count: 0, until: 0 };
+    const obj = await env.NAV_R2.get(key);
+    if (obj) { try { const p = await obj.json(); if (p && p.until > Date.now()) state = p; } catch { /* 忽略 */ } }
+    state.count = (state.count || 0) + 1;
+    state.until = Date.now() + windowMs;
+    await env.NAV_R2.put(key, JSON.stringify(state));
+    return { blocked: state.count > limit, count: state.count };
+}
+
+// 🟢 Turnstile 人机验证
+// 密钥优先读「应用内设置」(R2: sys_settings)，没有则回退环境变量；两者都没有则自动关闭。
+// 应急开关 sys_turnstile_off 只允许在 Cloudflare 控制台写（R2 对象），
+// 用于「密钥/域名配错导致连管理员都登不进去」时的自救。
+const TS_CONFIG_CODES = ['missing-input-secret', 'invalid-input-secret', 'bad-request'];
+const TS_HINTS = {
+    '110100': 'Site Key 无效或格式错误', '400020': 'Site Key 无效或填反了（Site Key / Secret Key 不要互换）',
+    '110110': 'Site Key 不存在或不属于当前账号', '110200': '当前域名未在 widget 的 Hostname Management 中授权（workers.dev 需显式添加）',
+    '400021': '域名与 Site Key 不匹配', '110500': '组件模式不匹配（应为 Managed）',
+    '110600': '验证超时，请刷新重试', '400070': 'Site Key 已停用',
+};
+
+async function getSysSettings(env) {
+    const obj = await env.NAV_R2.get('sys_settings');
+    if (!obj) return {};
+    try { const s = await obj.json(); return (s && typeof s === 'object') ? s : {}; } catch { return {}; }
+}
+async function putSysSettings(env, settings) {
+    const { __turnstileOff, ...clean } = settings || {};   // 防止内部标记被持久化
+    await env.NAV_R2.put('sys_settings', JSON.stringify(clean), { httpMetadata: { contentType: 'application/json' } });
+}
+async function isTurnstileForceOff(env) {
+    const obj = await env.NAV_R2.get('sys_turnstile_off');
+    if (!obj) return false;
+    try { const t = (await obj.text()).trim(); return t !== '' && t !== '0'; } catch { return false; }
+}
+/** 「是否启用」的唯一出口：任何地方都不要重复手写 Boolean(siteKey && secretKey)，否则破窗开关会失效 */
+async function resolveTurnstile(env) {
+    const off = await isTurnstileForceOff(env);
+    const s = await getSysSettings(env);
+    if (off) return { enabled: false, siteKey: null, secretKey: null, mode: 'strict', source: 'emergency-off' };
+    if (s.turnstileSiteKey && s.turnstileSecretKey) {
+        return { enabled: true, siteKey: s.turnstileSiteKey, secretKey: s.turnstileSecretKey, mode: s.turnstileMode === 'lenient' ? 'lenient' : 'strict', source: 'settings' };
+    }
+    if (env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY) {
+        return { enabled: true, siteKey: env.TURNSTILE_SITE_KEY, secretKey: env.TURNSTILE_SECRET_KEY, mode: 'strict', source: 'env' };
+    }
+    return { enabled: false, siteKey: null, secretKey: null, mode: 'strict', source: 'none' };
+}
+function maskKey(k) { return k ? String(k).slice(0, 6) + '••••••••' + String(k).slice(-4) : ''; }
+
+async function callSiteVerify(secretKey, token, ip) {
+    const fd = new FormData();
+    fd.append('secret', secretKey);
+    fd.append('response', token || '');
+    if (ip && ip !== 'unknown') fd.append('remoteip', ip);
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: fd });
+    try { return await res.json(); } catch { return { success: false, 'error-codes': ['bad-request'] }; }
+}
+
+/** 只把「非请求方原因」（密钥无效 / 服务不可达）标记为 configError —— 这类失败请求方无法制造，可安全降级 */
+async function verifyTurnstile(token, secretKey, ip) {
+    if (!secretKey) return { ok: true, skipped: true, codes: [], configError: false };
+    if (!token) {
+        // 用必定无效的探针 token 判断「这把密钥本身能不能用」
+        try {
+            const probe = await callSiteVerify(secretKey, 'XXXX.DUMMY.TOKEN.XXXX', ip);
+            const codes = probe['error-codes'] || [];
+            const broken = codes.some(c => TS_CONFIG_CODES.includes(c));
+            return { ok: false, codes: broken ? codes : ['missing-input-response'], configError: broken };
+        } catch { return { ok: false, codes: ['network-error'], configError: true }; }
+    }
+    try {
+        const out = await callSiteVerify(secretKey, token, ip);
+        const codes = out['error-codes'] || [];
+        const ok = Boolean(out.success);
+        return { ok, codes, configError: !ok && codes.some(c => TS_CONFIG_CODES.includes(c) || c === 'network-error' || c === 'internal-error') };
+    } catch { return { ok: false, codes: ['network-error'], configError: true }; }
+}
+
+function tsWarningText(result, mode) {
+    const list = result.codes || [];
+    const codes = list.join(', ') || 'unknown';
+    const base = list.includes('network-error') ? '人机验证服务暂时不可达'
+        : (list.some(c => TS_CONFIG_CODES.includes(c)) ? '人机验证密钥无效' : '人机验证组件异常');
+    const tail = mode === 'lenient' ? '，当前为「宽松模式」，已临时放行（防护强度已降低）' : '，已临时放行以免把管理员锁在门外';
+    return base + tail + '。请到「系统设置 → 人机验证」检查配置（错误码：' + codes + '）。';
+}
+
+async function adjudicateTurnstile(cfToken, ts, ip, clientError) {
+    if (!ts.enabled) return { pass: true, warning: '', codes: [] };
+    const result = await verifyTurnstile(cfToken, ts.secretKey, ip);
+    if (clientError) console.warn('[turnstile] client error code:', String(clientError).slice(0, 32)); // 仅记录，绝不参与放行判断
+    if (result.ok) return { pass: true, warning: '', codes: [] };
+    if (!result.configError && ts.mode !== 'lenient') return { pass: false, warning: '', codes: result.codes };
+    return { pass: true, warning: tsWarningText(result, ts.mode), codes: result.codes };
+}
+
 /** SSRF 防护：只放行 http/https，拦截 localhost / 内网 / 保留地址 */
 function isSafeTarget(rawUrl) {
     let u;
@@ -951,7 +1220,9 @@ export default {
             // Main UI Route
             if (path === "/" || path === "/index.html") {
                 const coords = { lat: request.cf?.latitude || null, lon: request.cf?.longitude || null };
-                return new Response(HTML_TEMPLATE({ coords }), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-cache" } });
+                const ts = await resolveTurnstile(env);
+                const turnstile = { enabled: ts.enabled, siteKey: ts.enabled ? ts.siteKey : '', mode: ts.mode };
+                return new Response(HTML_TEMPLATE({ coords, turnstile }), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-cache" } });
             }
             
             // --- R2 Storage Handlers ---
@@ -1016,13 +1287,22 @@ export default {
                 const existing = await env.NAV_R2.get("admin_hash");
                 if (existing) return new Response("Forbidden", { status: 403, headers: cors });
 
+                const ip = request.headers.get("CF-Connecting-IP") || "";
+                const gate = await checkLoginThrottle(env, ip);
+                if (gate.blocked) return new Response(JSON.stringify({ error: "too_many_attempts" }), { status: 429, headers: cors });
+
                 const body = await request.json();
                 if (!body || !body.username || !body.password) return new Response("Bad Request", { status: 400, headers: cors });
+
+                const ts = await resolveTurnstile(env);
+                const verdict = await adjudicateTurnstile(body.cfToken, ts, ip, body.cfError);
+                if (!verdict.pass) { await recordLoginFail(env, ip); return new Response(JSON.stringify({ error: 'turnstile_failed', codes: verdict.codes }), { status: 403, headers: cors }); }
+
                 const salt = randomHex(16);
                 const creds = { username: body.username, salt, password: await hashText(salt + body.password) };
                 await env.NAV_R2.put("admin_hash", JSON.stringify(creds));
                 const token = await createSession(env, creds.username);
-                return new Response(JSON.stringify({ token }), { headers: cors });
+                return new Response(JSON.stringify({ token, warning: verdict.warning }), { headers: cors });
             }
 
             if (path === "/api/login" && request.method === "POST") {
@@ -1030,14 +1310,84 @@ export default {
                 const gate = await checkLoginThrottle(env, ip);
                 if (gate.blocked) return new Response(JSON.stringify({ error: "too_many_attempts", retryAfter: gate.retryAfter }), { status: 429, headers: cors });
                 const body = await request.json();
+
+                const ts = await resolveTurnstile(env);
+                const verdict = await adjudicateTurnstile(body?.cfToken, ts, ip, body?.cfError);
+                if (!verdict.pass) { await recordLoginFail(env, ip); return new Response(JSON.stringify({ error: 'turnstile_failed', codes: verdict.codes }), { status: 403, headers: cors }); }
+
                 const stored = await verifyCreds(env, body?.username, body?.password);
                 if (stored) {
                     await clearLoginFails(env, ip);
                     const token = await createSession(env, stored.username);
-                    return new Response(JSON.stringify({ token }), { headers: cors });
+                    return new Response(JSON.stringify({ token, warning: verdict.warning }), { headers: cors });
                 }
                 await recordLoginFail(env, ip);
                 return new Response("Unauthorized", { status: 401, headers: cors });
+            }
+
+            // 🟢 Turnstile 密钥配置（需登录）。字段不传=不修改，显式传空串=清空
+            if (path === "/api/settings/turnstile") {
+                if (!(await checkAuth(request, env))) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: cors });
+                if (request.method === "GET") {
+                    const s = await getSysSettings(env);
+                    const off = await isTurnstileForceOff(env);
+                    const ts = await resolveTurnstile(env);
+                    return new Response(JSON.stringify({
+                        siteKeySet: Boolean(s.turnstileSiteKey), secretKeySet: Boolean(s.turnstileSecretKey),
+                        siteKeyMasked: maskKey(s.turnstileSiteKey), secretKeyMasked: maskKey(s.turnstileSecretKey),
+                        mode: s.turnstileMode === 'lenient' ? 'lenient' : 'strict',
+                        source: ts.source, enabled: ts.enabled, emergencyOff: off,
+                        envFallback: { siteKeySet: Boolean(env.TURNSTILE_SITE_KEY), secretKeySet: Boolean(env.TURNSTILE_SECRET_KEY) },
+                    }), { headers: cors });
+                }
+                if (request.method === "POST") {
+                    let body;
+                    try { body = JSON.parse(await request.text()); } catch { return new Response(JSON.stringify({ message: '请求格式错误' }), { status: 400, headers: cors }); }
+                    const s = await getSysSettings(env);
+                    if (typeof body.siteKey === 'string') s.turnstileSiteKey = body.siteKey.trim();
+                    if (typeof body.secretKey === 'string') s.turnstileSecretKey = body.secretKey.trim();
+                    if (body.mode === 'strict' || body.mode === 'lenient') s.turnstileMode = body.mode;
+                    if (s.turnstileSiteKey && s.turnstileSecretKey && s.turnstileSiteKey === s.turnstileSecretKey) {
+                        return new Response(JSON.stringify({ message: 'Site Key 与 Secret Key 不能相同（很可能填反了）' }), { status: 400, headers: cors });
+                    }
+                    if (Boolean(s.turnstileSiteKey) !== Boolean(s.turnstileSecretKey)) {
+                        return new Response(JSON.stringify({ message: 'Site Key 与 Secret Key 必须成对配置，或同时清空' }), { status: 400, headers: cors });
+                    }
+                    await putSysSettings(env, s);
+                    return new Response(JSON.stringify({ ok: true }), { headers: cors });
+                }
+            }
+
+            // 🟢 Turnstile 自检（无需登录，专供「正因为配错而登不进去」时使用），按 IP 限流
+            if (path === "/api/turnstile/diagnose" && request.method === "GET") {
+                const ip = request.headers.get("CF-Connecting-IP") || "";
+                const rl = await bumpRate(env, 'diag_' + ip, 10, 15 * 60 * 1000);
+                if (rl.blocked) return new Response(JSON.stringify({ error: 'rate_limited', message: '检测过于频繁，请 15 分钟后再试' }), { status: 429, headers: cors });
+                const s = await getSysSettings(env);
+                const ts = await resolveTurnstile(env);
+                let conclusion = 'not-configured', codes = [], advice = '';
+                if (ts.source === 'emergency-off') {
+                    conclusion = 'emergency-off'; advice = '已通过 R2 对象 sys_turnstile_off 应急关闭；删除该对象即可恢复验证。';
+                } else if (!ts.enabled) {
+                    conclusion = 'not-configured'; advice = '尚未配置（或只配了一半），登录当前不做人机验证。';
+                } else {
+                    const probe = await verifyTurnstile('', ts.secretKey, ip);
+                    codes = probe.codes || [];
+                    if (probe.configError) {
+                        const unreachable = codes.includes('network-error');
+                        conclusion = unreachable ? 'unreachable' : 'secret-invalid';
+                        advice = unreachable ? '无法访问 Cloudflare 验证服务（网络问题），当前会临时放行。' : 'Secret Key 无效：请核对是否与 Site Key 填反、或复制不完整。';
+                    } else {
+                        conclusion = 'secret-ok'; advice = '密钥有效。若组件仍报错，多为域名未授权（110200），请检查该 widget 的 Hostname Management。';
+                    }
+                }
+                const text = { 'not-configured': '未配置', 'emergency-off': '已应急关闭', 'secret-invalid': 'Secret Key 无效', 'secret-ok': '密钥有效', 'unreachable': '验证服务不可达' }[conclusion];
+                return new Response(JSON.stringify({
+                    conclusion, conclusionText: text, advice, codes, host: request.headers.get("Host") || url.host,
+                    source: ts.source, mode: ts.mode, enabled: ts.enabled,
+                    siteKeyMasked: maskKey(s.turnstileSiteKey || env.TURNSTILE_SITE_KEY),
+                    secretKeySet: Boolean(ts.secretKey), emergencyOff: ts.source === 'emergency-off',
+                }), { headers: cors });
             }
 
             if (path === "/api/logout" && request.method === "POST") {

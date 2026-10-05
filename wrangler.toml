@@ -18,3 +18,15 @@ compatibility_date = "2024-05-01"
 [[r2_buckets]]
 binding = "NAV_R2"                 # 必须与 _worker.js 中的 env.NAV_R2 严格一致
 bucket_name = "nexus-nav-data"     # 如需改名，同时改 scripts/ensure-r2.mjs 的兜底默认值
+
+# 🔐 可选：人机验证（Cloudflare Turnstile）
+# 密钥优先在「应用内 → 系统设置 → 人机验证」配置（存 R2，未加密）。
+# 若更看重静态加密，可改用环境变量（二选一即可，切勿写空值）：
+#   wrangler secret put TURNSTILE_SITE_KEY
+#   wrangler secret put TURNSTILE_SECRET_KEY
+# 或在控制台 Worker → Settings → Variables and Secrets 中添加。
+# 两者都没有时人机验证自动关闭，不影响登录。
+
+# 🆘 应急：若因配置错误导致无法登录，在控制台 R2 桶中添加对象
+#   sys_turnstile_off = 1
+# 即可立即关闭人机验证（删除该对象或改为 0 即恢复）。
