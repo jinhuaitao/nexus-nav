@@ -34,6 +34,7 @@ _worker.js            # Worker 入口（前端页面 + API，单文件）
 wrangler.toml         # 声明 name / main / R2 绑定
 package.json          # 定义 deploy 脚本：先建桶，再部署
 scripts/ensure-r2.mjs # 幂等建桶脚本
+tests/                # 拖动排序回归测试（npm test，可选）
 .gitignore            # 忽略 node_modules / .wrangler / .dev.vars
 ```
 
@@ -301,11 +302,22 @@ Sortable 在 `forceFallback: true` 模式下会 `cloneNode` 出一个「跟着�
 
 ### 回归测试
 
-`_worker.js` 的拖动逻辑有一份基于**真实 DOM + 真实 Alpine 3.13.3 + 真实 Sortable 1.15.0**（jsdom）的回归测试，覆盖：
+仓库自带一份基于**真实 DOM + 真实 Alpine 3.13.3 + 真实 Sortable 1.15.0** 的拖动回归测试（跑在 jsdom 里，不需要浏览器）：
+
+```bash
+npm install
+npm test        # node tests/sortable.test.mjs
+```
+
+覆盖：
 
 - 跟手克隆体必须可见（CSS 断言）
-- 组内拖动：把第 i 个依次拖到每个位置，校验 DOM 顺序精确等于语义期望
+- 组内拖动：把第 i 个依次拖到每个位置（25 次），校验 DOM 与数据精确等于语义期望
 - 跨组拖动：两端都不丢项、不重复，DOM 与数据一致
-- 连续随机拖动 10 轮后仍然稳定
+- 连续 10 轮随机拖动（含跨组）后仍然稳定
+- 正常路径**不会**触发强制重建（保证无多余闪烁）
 - 兜底自愈：人为打乱 DOM 后能强制重建回正确顺序
+
+> 测试用的 Alpine / Sortable 从**和页面完全相同的 CDN 地址**拉取，并缓存到 `tests/.cache/`，
+> 所以测试跑的版本永远不会和线上跑偏。
 
