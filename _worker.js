@@ -402,7 +402,7 @@ const HTML_TEMPLATE = (context) => `
 
          ⚠️ 关闭方式是「遮罩层 @click.self」，**不能用 @click.away**：
          .away 会挂一个 document 级监听；而 x-if 插入的新节点 _x_isShown 是 undefined
-         （x-show 会把它管成 false），判定式 `_x_isShown !== false` 因此成立 ——
+         （x-show 会把它管成 false），判定式「_x_isShown !== false」因此成立 ——
          于是「打开弹窗的那一次点击」冒泡到 document 时，会被刚注册的 .away 监听当场捕获，
          弹窗开了又立刻被关掉，表现就是「点击登录按钮没有反应」。
          @click.self 只认「点到遮罩本身」，不注册任何全局监听，从根上避开这个时序陷阱。 -->
