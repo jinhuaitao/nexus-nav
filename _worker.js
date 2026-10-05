@@ -433,6 +433,8 @@ const HTML_TEMPLATE = (context) => `
                     <div x-show="tsCfg.enabled" class="mb-4">
                         <div x-ref="tsBox" class="flex justify-center min-h-[65px]"></div>
                         <p x-show="tsError" class="text-[11px] text-red-400 text-center mt-2 leading-relaxed" x-text="tsError"></p>
+                        <p x-show="tsServerMsg" class="text-[11px] text-amber-400 text-center mt-2 leading-relaxed" x-text="tsServerMsg"></p>
+                        <button type="button" x-show="tsError || tsServerMsg" @click="openDiagnose()" class="block mx-auto mt-2 text-[11px] underline opacity-60 hover:opacity-100 transition" style="color: var(--text-secondary)">人机验证自检（无需登录）</button>
                     </div>
                     <button type="submit" class="w-full py-3.5 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold shadow-lg shadow-indigo-500/20 transition transform active:scale-95 disabled:opacity-50" :disabled="status.submitting"><span x-show="!status.submitting" x-text="needsSetup ? '系统初始化' : '登录控制台'"></span><span x-show="status.submitting"><i class="fa-solid fa-circle-notch fa-spin"></i></span></button>
                 </form>
@@ -577,7 +579,7 @@ const HTML_TEMPLATE = (context) => `
                 toastTimer: null,
                 confirmBox: { show: false, title: '', message: '', okText: '确认', danger: true, onOk: null },
                 tsCfg: (window.TURNSTILE_CFG || { enabled: false, siteKey: '', mode: 'strict' }),
-                turnstileToken: '', tsError: '', tsWidgetId: null, tsPollTimer: null,
+                turnstileToken: '', tsError: '', tsServerMsg: '', tsWidgetId: null, tsPollTimer: null,
                 tsWarning: (function () { try { return sessionStorage.getItem('nexus_ts_warning') || ''; } catch (e) { return ''; } })(),
                 ts: { form: { siteKey: '', secretKey: '', mode: 'strict' }, siteKeySet: false, secretKeySet: false, siteKeyMasked: '', secretKeyMasked: '', source: 'none', enabled: false, emergencyOff: false, result: '', resultOk: true, badgeText: '未配置', badgeClass: 'border-gray-500/30 text-gray-400' },
                 settings: { bgType: 'bing', customBg: '', blur: 0, engine: 'google', customSearchUrl: '', showBgInLight: false, iconSize: 32, layoutWidth: 'center', iconOpacity: 100, cardOpacity: 40, headerOpacity: 75, memo: '' },
@@ -998,7 +1000,7 @@ const HTML_TEMPLATE = (context) => `
                     }
                 }, 
                 async saveSettings() { await this.saveAll(); },
-                async checkStatus() { try { const res = await fetch('/api/status'); this.needsSetup = !(await res.json()).setup; if(this.needsSetup) { this.modals.login = true; this.$nextTick(() => this.renderTurnstile()); } } catch(e) {} },
+                async checkStatus() { try { const res = await fetch('/api/status'); this.needsSetup = !(await res.json()).setup; if(this.needsSetup) { this.modals.login = true; await this.refreshTsCfg(); this.ensureTsScript(); this.$nextTick(() => this.renderTurnstile()); } } catch(e) {} },
                 async handleAuth() {
                     this.status.submitting = true;
                     const endpoint = this.needsSetup ? '/api/setup' : '/api/login';
@@ -1017,9 +1019,17 @@ const HTML_TEMPLATE = (context) => `
                             this.showToast('尝试次数过多，请稍后再试', 'error'); this.authForm.password = ''; this.resetTurnstile();
                         } else if (res.status === 403) {
                             const d = await res.json().catch(() => ({}));
-                            if (d.error === 'turnstile_failed') this.showToast('人机验证未通过，请重新完成验证', 'error');
-                            else { this.showToast('系统已初始化，请直接登录', 'error'); this.needsSetup = false; }
-                            this.authForm.password = ''; this.resetTurnstile();
+                            if (d.error === 'turnstile_failed') {
+                                const msg = d.message || '人机验证未通过，请重新完成验证';
+                                this.showToast(msg, 'error');
+                                // 把服务端的具体原因留在弹窗里：toast 2.5 秒就消失，看不到就无从排查。
+                                // 服务端返回的 codes 能区分「没拿到 token」/「token 无效」/「token 过期」三种完全不同的成因。
+                                this.tsServerMsg = '服务端判定：' + ((d.codes && d.codes.length) ? d.codes.join(', ') : 'unknown') + '。' + msg;
+                            } else { this.showToast('系统已初始化，请直接登录', 'error'); this.needsSetup = false; }
+                            this.authForm.password = '';
+                            // 只清 token，保留组件自身的错误提示（resetTurnstile() 会把两者一起抹掉）
+                            this.turnstileToken = '';
+                            try { if (window.turnstile && this.tsWidgetId !== null) window.turnstile.reset(this.tsWidgetId); } catch (e) {}
                         } else {
                             this.showToast('用户名或密码错误', 'error'); this.authForm.password = ''; this.resetTurnstile();
                         }
@@ -1046,7 +1056,39 @@ const HTML_TEMPLATE = (context) => `
                 doConfirm() { const fn = this.confirmBox.onOk; this.confirmBox.show = false; if (typeof fn === 'function') fn(); },
 
                 // 🟢 Turnstile：登录页组件渲染 / 重置
-                openLogin() { this.modals.login = true; this.$nextTick(() => this.renderTurnstile()); },
+                async openLogin() {
+                    this.modals.login = true; this.tsServerMsg = '';
+                    await this.refreshTsCfg();       // 先拉一次实时配置，见下方注释
+                    this.ensureTsScript();
+                    this.$nextTick(() => this.renderTurnstile());
+                },
+                // 🟢 实时刷新 Turnstile 配置（修复「配了验证却提示未通过」的根因）。
+                // window.TURNSTILE_CFG 是服务端渲染 HTML 那一刻写死的。若用户在「系统设置 → 人机验证」
+                // 保存密钥后没有刷新页面（例如保存后直接「安全退出」再登录），客户端仍以为「未启用」：
+                //   1) x-show="tsCfg.enabled" 为假 → 验证框根本不显示；renderTurnstile() 也会提前 return；
+                //   2) 提交时 turnstileToken 为空 → 服务端判定 403 turnstile_failed → 提示「人机验证未通过」。
+                // 而服务端此刻已经是启用状态，所以用户无论重试多少次都过不去，只有强制刷新页面才行。
+                // 因此在打开登录弹窗时实时拉取一次配置，让前后端状态对齐。
+                async refreshTsCfg() {
+                    try {
+                        const res = await fetch('/api/turnstile/config');
+                        if (!res.ok) return;
+                        const d = await res.json();
+                        this.tsCfg = { enabled: !!d.enabled, siteKey: d.siteKey || '', mode: d.mode === 'lenient' ? 'lenient' : 'strict' };
+                    } catch (e) {}
+                },
+                // 页面首次渲染时若尚未启用，服务端不会注入 Turnstile 的 api.js。
+                // 之后在设置里启用（或强制刷新后配置变化）时，需要在这里动态补一次脚本，
+                // 否则 renderTurnstile() 的轮询会一直等不到 window.turnstile。
+                ensureTsScript() {
+                    if (!this.tsCfg.enabled || window.turnstile) return;
+                    if (document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]')) return; // 已存在（可能仍在加载），交给轮询
+                    const s = document.createElement('script');
+                    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                    s.async = true; s.defer = true;
+                    document.head.appendChild(s);
+                },
+                openDiagnose() { window.open('/api/turnstile/diagnose', '_blank', 'noopener,noreferrer'); },
                 // 关闭登录弹窗。因为弹窗改成 x-if 按需渲染了，关闭时整块 DOM 会被销毁，
                 // 所以必须顺手把 Turnstile 组件也摘掉并清空 widgetId —— 否则下次打开时
                 // renderTurnstile() 会拿着一个已失效的 id 去 reset()，验证框会一直空白。
@@ -1055,11 +1097,14 @@ const HTML_TEMPLATE = (context) => `
                     try { if (window.turnstile && this.tsWidgetId !== null && window.turnstile.remove) window.turnstile.remove(this.tsWidgetId); } catch (e) {}
                     this.tsWidgetId = null;
                     if (this.tsPollTimer) { clearInterval(this.tsPollTimer); this.tsPollTimer = null; }
-                    this.turnstileToken = ''; this.tsError = '';
+                    this.turnstileToken = ''; this.tsError = ''; this.tsServerMsg = '';
                 },
                 tsHint(code) { const m = { '110100': 'Site Key 无效或格式错误', '400020': 'Site Key 无效或填反了（Site Key / Secret Key 不要互换）', '110110': 'Site Key 不存在或不属于当前账号', '110200': '当前域名未在 widget 的 Hostname Management 中授权（workers.dev 需显式添加）', '400021': '域名与 Site Key 不匹配', '110500': '组件模式不匹配（应为 Managed）', '110600': '验证超时，请刷新重试', '400070': 'Site Key 已停用' }; return '人机验证组件异常：' + (m[String(code)] || ('错误码 ' + code)); },
                 renderTurnstile() {
-                    if (!this.tsCfg.enabled || !this.tsCfg.siteKey) return;
+                    if (!this.tsCfg.enabled) return;
+                    // 「已启用但没拿到 Site Key」绝不能静默返回：那会让用户面对一个没有验证框、
+                    // 却每次都提示「人机验证未通过」的登录页，完全无从下手。
+                    if (!this.tsCfg.siteKey) { this.tsError = '未获取到 Site Key：请到「系统设置 → 人机验证」确认两把密钥已成对保存。'; return; }
                     const el = this.$refs.tsBox;
                     if (!el) return;
                     if (!(window.turnstile && window.turnstile.render)) {
@@ -1120,7 +1165,11 @@ const HTML_TEMPLATE = (context) => `
                         const d = await res.json().catch(() => ({}));
                         if (!res.ok) return this.showToast(d.message || '保存失败', 'error');
                         await this.loadTurnstile();
-                        this.showToast('已保存，下次打开登录页生效');
+                        // 立刻让当前页面与新配置对齐（无需刷新）。否则不刷新页面时，登录弹窗仍按旧配置渲染，
+                        // 就会出现「服务端已启用、页面上却没有验证框」→ 提交必然 403「人机验证未通过」的死循环。
+                        await this.refreshTsCfg();
+                        if (this.tsCfg.enabled) this.ensureTsScript();
+                        this.showToast('已保存并即时生效');
                     } catch (e) { this.showToast('网络异常，请稍后重试', 'error'); }
                 },
                 clearTurnstile() { this.askConfirm('将同时清空 Site Key 与 Secret Key，登录将不再进行人机验证。', async () => {
@@ -1128,7 +1177,7 @@ const HTML_TEMPLATE = (context) => `
                         const res = await fetch('/api/settings/turnstile', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': this.token }, body: JSON.stringify({ siteKey: '', secretKey: '' }) });
                         const d = await res.json().catch(() => ({}));
                         if (!res.ok) return this.showToast(d.message || '操作失败', 'error');
-                        await this.loadTurnstile(); this.showToast('已清空验证配置');
+                        await this.loadTurnstile(); await this.refreshTsCfg(); this.showToast('已清空验证配置');
                     } catch (e) { this.showToast('网络异常', 'error'); }
                 }, { okText: '清空' }); },
                 async diagnoseTurnstile() {
@@ -1295,6 +1344,22 @@ const TS_HINTS = {
     '400021': '域名与 Site Key 不匹配', '110500': '组件模式不匹配（应为 Managed）',
     '110600': '验证超时，请刷新重试', '400070': 'Site Key 已停用',
 };
+
+// siteverify 返回的「请求方原因」错误码 → 可读原因。
+// 这些码只用于「告诉用户为什么被拦」，绝不参与放行判断（那是 verifyTurnstile 的职责）。
+const TS_FAIL_HINTS = {
+    'missing-input-response': '页面没有把验证令牌发过来：验证组件未加载、未完成验证，或页面里还是旧的配置（保存密钥后未刷新页面）。请按 Ctrl/Cmd+Shift+R 强制刷新后重新验证。',
+    'invalid-input-response': '验证令牌无效：Site Key 与 Secret Key 可能取自两个不同的 widget，或令牌已被使用/失效。请核对两把密钥是否来自同一个 widget。',
+    'timeout-or-duplicate': '验证令牌已过期或已被重复使用（有效期 300 秒）。请重新完成一次验证后再提交。',
+    'bad-request': 'Cloudflare 拒绝了本次请求（bad-request）：Secret Key 格式可能不正确，请检查是否复制完整。',
+    'internal-error': 'Cloudflare 验证服务内部错误，请稍后重试。',
+    'network-error': '无法连接 Cloudflare 验证服务，请检查网络后重试。',
+};
+function tsFailMessage(codes) {
+    const list = Array.isArray(codes) ? codes : [];
+    for (const c of list) { if (TS_FAIL_HINTS[c]) return TS_FAIL_HINTS[c]; }
+    return '人机验证未通过，请重新完成验证。';
+}
 
 async function getSysSettings(env) {
     const obj = await env.NAV_R2.get('sys_settings');
@@ -1535,7 +1600,7 @@ export default {
 
                 const ts = await resolveTurnstile(env);
                 const verdict = await adjudicateTurnstile(body.cfToken, ts, ip, body.cfError);
-                if (!verdict.pass) { await recordLoginFail(env, ip); return new Response(JSON.stringify({ error: 'turnstile_failed', codes: verdict.codes }), { status: 403, headers: cors }); }
+                if (!verdict.pass) { await recordLoginFail(env, ip); return new Response(JSON.stringify({ error: 'turnstile_failed', codes: verdict.codes, message: tsFailMessage(verdict.codes) }), { status: 403, headers: cors }); }
 
                 const salt = randomHex(16);
                 const creds = { username: body.username, salt, password: await hashText(salt + body.password) };
@@ -1552,7 +1617,7 @@ export default {
 
                 const ts = await resolveTurnstile(env);
                 const verdict = await adjudicateTurnstile(body?.cfToken, ts, ip, body?.cfError);
-                if (!verdict.pass) { await recordLoginFail(env, ip); return new Response(JSON.stringify({ error: 'turnstile_failed', codes: verdict.codes }), { status: 403, headers: cors }); }
+                if (!verdict.pass) { await recordLoginFail(env, ip); return new Response(JSON.stringify({ error: 'turnstile_failed', codes: verdict.codes, message: tsFailMessage(verdict.codes) }), { status: 403, headers: cors }); }
 
                 const stored = await verifyCreds(env, body?.username, body?.password);
                 if (stored) {
@@ -1595,6 +1660,18 @@ export default {
                     await putSysSettings(env, s);
                     return new Response(JSON.stringify({ ok: true }), { headers: cors });
                 }
+            }
+
+            // 🟢 Turnstile 运行时配置（公开、无需登录）。只回显 Site Key —— 它本就是公开值，绝不返回 Secret Key。
+            // 登录弹窗打开时会实时拉取一次。原因见前端 refreshTsCfg() 的注释：
+            // 页面里的 TURNSTILE_CFG 是 HTML 渲染时写死的，保存密钥后不刷新页面就会「服务端已启用、页面还以为没启用」，
+            // 于是验证组件根本不渲染 → 永远拿不到 token → 每次提交都是 403「人机验证未通过」，怎么重试都好不了。
+            if (path === "/api/turnstile/config" && request.method === "GET") {
+                const ts = await resolveTurnstile(env);
+                return new Response(JSON.stringify({
+                    enabled: ts.enabled, siteKey: ts.enabled ? ts.siteKey : '',
+                    mode: ts.mode, source: ts.source,
+                }), { headers: cors });
             }
 
             // 🟢 Turnstile 自检（无需登录，专供「正因为配错而登不进去」时使用），按 IP 限流
