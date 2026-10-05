@@ -1,14 +1,26 @@
 /**
  * Cloudflare Worker Navigation Site v22.7 (Autofill Off Edition)
  *
- * Changelog (v22.7):
- * - [FIX]  顶部搜索框不再被浏览器自动填充：补齐 autocomplete / autocorrect / autocapitalize / spellcheck，
- *          以及密码管理器的忽略标记（data-form-type / data-lpignore / data-1p-ignore）。
+ * Changelog (v22.7 Autofill Off Edition):
+ * - [FIX]  「每次刷新账号被填进搜索框」的**根因**：登录弹窗原本用 x-show 隐藏，
+ *          也就是那个 <input type="password"> 一直常驻在 DOM 里。Chrome 的密码管理器
+ *          一旦在页面上扫到密码框，就会去找一个「用户名输入框」去填 —— 而隐藏字段会被它跳过，
+ *          于是它挑中了页面上第一个可见文本框：顶部搜索框。
+ *          现在登录弹窗改成 <template x-if="modals.login"> 按需渲染：不打开时整块 DOM 都不存在，
+ *          浏览器根本无从下手。配套新增 closeLogin()，关闭时同步摘掉 Turnstile 组件并复位 widgetId。
+ *          系统设置面板同理（里面有一个 <input type="password"> 用于 Turnstile Secret Key），
+ *          一并改成 x-if。改完之后，页面在「用户没有主动打开凭据弹窗」时，DOM 里
+ *          不存在任何 type="password"，浏览器彻底失去自动填充的触发点。
+ *          （此前的 autocomplete="off" / data-lpignore 等静态属性只能治标，改不掉「密码框常驻」这个病根。）
+ * - [FIX]  登录框两个字段明确标注 autocomplete="username" / "current-password"，
+ *          打开弹窗时浏览器能准确地把账号密码填到该填的地方。
+ * - [FIX]  顶部搜索框不再被自动填充：补齐 autocomplete / autocorrect / autocapitalize / spellcheck，
+ *          以及密码管理器忽略标记（data-form-type / data-lpignore / data-1p-ignore）。
  *          **刻意不加 name 属性** —— 浏览器的「表单历史」是按 (form, name) 记录的，
  *          没有 name 就不会攒出那个「上次搜过什么」的下拉列表。
- * - [FIX]  登录框的两个字段明确标注 autocomplete="username" / "current-password"。
- *          登录弹窗其实一直在 DOM 里（只是 x-show 隐藏），浏览器容易把页面上的其它文本框
- *          ——尤其是顶部搜索框——猜成「用户名」，然后把保存的账号填进去；标注清楚后就不会再猜。
+ * - [FIX]  运行时兜底：个别浏览器 / 密码管理器会在页面稳定之后才灌值，绕过所有静态属性。
+ *          init() 里在 200ms / 800ms / 2000ms 以及 load、pageshow 五个时间点做一次校验 ——
+ *          只要搜索框在「用户还没碰过它」之前出现了非空内容，就判定为自动填充并连 Alpine 状态一起复位。
  * - [FEAT] 搜索框补 aria-label，并把移动端键盘的回车键改成「搜索」（inputmode / enterkeyhint）。
  * - [SYNC] 版本号仍由 APP_VERSION 单一来源派生。
  *
@@ -377,23 +389,28 @@ const HTML_TEMPLATE = (context) => `
         </div>
     </div>
 
-    <div x-show="modals.login" class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" x-cloak x-transition.opacity>
-        <div class="glass-panel p-8 rounded-2xl w-full max-w-sm relative overflow-hidden" style="background: var(--modal-bg)" @click.away="!needsSetup && (modals.login = false)">
-            <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 to-purple-500"></div>
-            <h2 class="text-xl font-bold mb-6 text-center" style="color: var(--text-primary)" x-text="needsSetup ? '初始化管理员' : '身份验证'"></h2>
-            <form @submit.prevent="handleAuth">
-                <!-- 明确标注这两个字段的用途：浏览器一旦确认「凭据字段在这里」，
-                     就不会再把保存的账号密码猜着填到页面上的其它文本框（比如顶部搜索框）里去。 -->
-                <input type="text" x-model="authForm.username" autocomplete="username" placeholder="用户名" class="search-input w-full mb-3 p-3.5 rounded-xl text-center" required>
-                <input type="password" x-model="authForm.password" autocomplete="current-password" placeholder="密码" class="search-input w-full p-3.5 rounded-xl text-center" :class="tsCfg.enabled ? 'mb-4' : 'mb-8'" required>
-                <div x-show="tsCfg.enabled" class="mb-4">
-                    <div x-ref="tsBox" class="flex justify-center min-h-[65px]"></div>
-                    <p x-show="tsError" class="text-[11px] text-red-400 text-center mt-2 leading-relaxed" x-text="tsError"></p>
-                </div>
-                <button type="submit" class="w-full py-3.5 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold shadow-lg shadow-indigo-500/20 transition transform active:scale-95 disabled:opacity-50" :disabled="status.submitting"><span x-show="!status.submitting" x-text="needsSetup ? '系统初始化' : '登录控制台'"></span><span x-show="status.submitting"><i class="fa-solid fa-circle-notch fa-spin"></i></span></button>
-            </form>
+    <!-- 🟢 按需渲染（x-if 而不是 x-show）：登录弹窗绝不能常驻 DOM。
+         它里面有一个密码输入框（type="password"）。浏览器（尤其 Chrome 的密码管理器）一旦在页面上扫到密码框，
+         就会去找「用户名输入框」准备自动填充 —— 而隐藏的字段会被它跳过，
+         于是它挑中了页面上第一个可见的文本框：顶部搜索框。
+         这就是「每次刷新账号被填进搜索框」的根因。关掉弹窗时整个 DOM 都不存在，浏览器无从下手。 -->
+    <template x-if="modals.login">
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" x-transition.opacity>
+            <div class="glass-panel p-8 rounded-2xl w-full max-w-sm relative overflow-hidden" style="background: var(--modal-bg)" @click.away="!needsSetup && closeLogin()">
+                <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 to-purple-500"></div>
+                <h2 class="text-xl font-bold mb-6 text-center" style="color: var(--text-primary)" x-text="needsSetup ? '初始化管理员' : '身份验证'"></h2>
+                <form @submit.prevent="handleAuth">
+                    <input type="text" x-model="authForm.username" autocomplete="username" placeholder="用户名" class="search-input w-full mb-3 p-3.5 rounded-xl text-center" required>
+                    <input type="password" x-model="authForm.password" autocomplete="current-password" placeholder="密码" class="search-input w-full p-3.5 rounded-xl text-center" :class="tsCfg.enabled ? 'mb-4' : 'mb-8'" required>
+                    <div x-show="tsCfg.enabled" class="mb-4">
+                        <div x-ref="tsBox" class="flex justify-center min-h-[65px]"></div>
+                        <p x-show="tsError" class="text-[11px] text-red-400 text-center mt-2 leading-relaxed" x-text="tsError"></p>
+                    </div>
+                    <button type="submit" class="w-full py-3.5 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold shadow-lg shadow-indigo-500/20 transition transform active:scale-95 disabled:opacity-50" :disabled="status.submitting"><span x-show="!status.submitting" x-text="needsSetup ? '系统初始化' : '登录控制台'"></span><span x-show="status.submitting"><i class="fa-solid fa-circle-notch fa-spin"></i></span></button>
+                </form>
+            </div>
         </div>
-    </div>
+    </template>
 
     <div x-show="modals.link" class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" x-cloak x-transition.opacity>
         <div class="glass-panel p-6 rounded-2xl w-full max-w-md relative" style="background: var(--modal-bg)" @click.away="modals.link = false">
@@ -420,7 +437,11 @@ const HTML_TEMPLATE = (context) => `
         </div>
     </div>
 
-    <div x-show="modals.settings" class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" x-cloak x-transition.opacity>
+    <!-- 🟢 同样按需渲染：设置面板里有一个密码输入框（Turnstile Secret Key）。
+         只要它常驻 DOM，浏览器就会在每次刷新时扫到密码框、进而去找「用户名输入框」，
+         最后还是把账号灌进顶部搜索框。这里没有 $refs、没有外部组件要挂载，整块 x-if 零副作用。 -->
+    <template x-if="modals.settings">
+    <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" x-transition.opacity>
         <div class="glass-panel p-6 rounded-2xl w-full max-w-md max-h-[85vh] overflow-y-auto" style="background: var(--modal-bg)" @click.away="modals.settings = false">
             <h3 class="text-lg font-bold mb-6" style="color: var(--text-primary)">系统设置</h3>
             <div class="space-y-6">
@@ -494,6 +515,7 @@ const HTML_TEMPLATE = (context) => `
             <div class="flex gap-3 mt-6"><button @click="resetSettings()" class="px-5 py-3.5 rounded-xl bg-gray-500/10 hover:bg-gray-500/20 text-sm font-bold transition" style="color: var(--text-secondary)">恢复默认</button><button @click="saveSettings(); modals.settings=false" class="flex-1 py-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold shadow-lg shadow-indigo-500/20 transition">保存更改</button></div>
         </div>
     </div>
+    </template>
 
     <div x-show="confirmBox.show" class="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" x-cloak x-transition.opacity>
         <div class="glass-panel p-6 rounded-2xl w-full max-w-sm" style="background: var(--modal-bg)" @click.away="confirmBox.show = false">
@@ -571,6 +593,34 @@ const HTML_TEMPLATE = (context) => `
                     if(params.get('action') === 'search') setTimeout(() => this.$refs.searchInput.focus(), 500);
                     if(params.get('action') === 'memo') setTimeout(() => { if(this.isLoggedIn) this.modals.memo = true; else this.showToast('请先登录使用便签', 'error'); }, 500);
 
+                    // 🟢 兜底防自动填充（v22.7）
+                    // 根因已经在弹窗那边解决掉了：登录框改成 <template x-if> 按需渲染，
+                    // 页面常驻 DOM 里不再有 <input type="password">，浏览器（Chrome 密码管理器）
+                    // 就失去了「找用户名框去填」的入口。
+                    // 但个别浏览器 / 密码管理器会在页面稳定之后才灌值，绕过上面那一堆静态属性
+                    // （autocomplete=off / data-lpignore / data-1p-ignore ...）的防护，所以这里再补一道
+                    // 运行时保险：在用户真正动手操作搜索框之前，只要它出现非空内容，就一律判定为
+                    // 自动填充并抹掉（连同 Alpine 状态一起复位，避免 x-model 把脏值带进筛选逻辑）。
+                    // 注意：登录框里的账号密码不做同样处理 —— 那是用户主动打开弹窗时
+                    // 浏览器替他填的，属于正常便利功能；弹窗关闭后 DOM 整体销毁，不会残留。
+                    let searchTouched = false;
+                    const searchEl = this.$refs.searchInput;
+                    if (searchEl) {
+                        const markTouched = () => { searchTouched = true; };
+                        ['keydown', 'keypress', 'paste', 'compositionstart', 'pointerdown', 'touchstart'].forEach(ev =>
+                            searchEl.addEventListener(ev, markTouched, { passive: true }));
+                        const scrubSearch = () => {
+                            if (searchTouched) return;
+                            const el = this.$refs.searchInput;
+                            if (!el) return;
+                            if (el.value || this.search) { el.value = ''; this.search = ''; this.updateSortableState(); }
+                        };
+                        // 多个时间点轮询 + load / pageshow（bfcache 回退时也会重新触发）
+                        [200, 800, 2000].forEach(t => setTimeout(scrubSearch, t));
+                        window.addEventListener('load', scrubSearch);
+                        window.addEventListener('pageshow', scrubSearch);
+                    }
+
                     this.$nextTick(() => { this.initGroupSortable(); this.updateSortableState(); this.status.loading = false; });
                 },
 
@@ -606,7 +656,7 @@ const HTML_TEMPLATE = (context) => `
                     if (e.key === 'Z' && e.shiftKey) { this.toggleZen(); }
                     if (e.key === 'N' && e.shiftKey && this.isLoggedIn) { this.modals.memo = true; }
                 },
-                closeAllModals() { this.modals.login = false; this.modals.link = false; this.modals.group = false; this.modals.settings = false; this.modals.memo = false; this.confirmBox.show = false; this.closeMenu(); },
+                closeAllModals() { this.closeLogin(); this.modals.link = false; this.modals.group = false; this.modals.settings = false; this.modals.memo = false; this.confirmBox.show = false; this.closeMenu(); },
                 toggleZen() { this.zenMode = !this.zenMode; },
                 
                 toggleEditMode() {
@@ -927,7 +977,7 @@ const HTML_TEMPLATE = (context) => `
                         if(res.ok) {
                             const data = await res.json();
                             this.token = data.token; localStorage.setItem('nexus_token', this.token);
-                            this.isLoggedIn = true; this.modals.login = false; this.needsSetup = false; this.authForm.password = '';
+                            this.isLoggedIn = true; this.closeLogin(); this.needsSetup = false; this.authForm.password = '';
                             if (data.warning) { this.tsWarning = data.warning; try { sessionStorage.setItem('nexus_ts_warning', data.warning); } catch(e) {} this.showToast('人机验证已临时放行，请检查配置', 'error'); }
                             else this.showToast('欢迎回来');
                             this.syncData('GET');
@@ -966,6 +1016,16 @@ const HTML_TEMPLATE = (context) => `
 
                 // 🟢 Turnstile：登录页组件渲染 / 重置
                 openLogin() { this.modals.login = true; this.$nextTick(() => this.renderTurnstile()); },
+                // 关闭登录弹窗。因为弹窗改成 x-if 按需渲染了，关闭时整块 DOM 会被销毁，
+                // 所以必须顺手把 Turnstile 组件也摘掉并清空 widgetId —— 否则下次打开时
+                // renderTurnstile() 会拿着一个已失效的 id 去 reset()，验证框会一直空白。
+                closeLogin() {
+                    this.modals.login = false;
+                    try { if (window.turnstile && this.tsWidgetId !== null && window.turnstile.remove) window.turnstile.remove(this.tsWidgetId); } catch (e) {}
+                    this.tsWidgetId = null;
+                    if (this.tsPollTimer) { clearInterval(this.tsPollTimer); this.tsPollTimer = null; }
+                    this.turnstileToken = ''; this.tsError = '';
+                },
                 tsHint(code) { const m = { '110100': 'Site Key 无效或格式错误', '400020': 'Site Key 无效或填反了（Site Key / Secret Key 不要互换）', '110110': 'Site Key 不存在或不属于当前账号', '110200': '当前域名未在 widget 的 Hostname Management 中授权（workers.dev 需显式添加）', '400021': '域名与 Site Key 不匹配', '110500': '组件模式不匹配（应为 Managed）', '110600': '验证超时，请刷新重试', '400070': 'Site Key 已停用' }; return '人机验证组件异常：' + (m[String(code)] || ('错误码 ' + code)); },
                 renderTurnstile() {
                     if (!this.tsCfg.enabled || !this.tsCfg.siteKey) return;
