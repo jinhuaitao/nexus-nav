@@ -1,5 +1,20 @@
 /**
- * Cloudflare Worker Navigation Site v22.8 (Click Fix Edition)
+ * Cloudflare Worker Navigation Site v22.9 (Login UI Edition)
+ *
+ * Changelog (v22.9 Login UI Edition):
+ * - [UI]  登录弹窗重做，与全站设计语言对齐：徽标沿用顶部栏那枚 fa-atom + indigo→purple 渐变
+ *         与玻璃质感（原来只有一个孤零零的标题），标题按「初始化 / 登录」两种语境给出不同文案与副标题。
+ * - [UI]  输入框改为「左侧图标 + 左对齐 + 聚焦时图标点亮」，不再是无标签的居中占位符；
+ *         顶部补一层柔光，让弹窗上半部分不至于死板。
+ * - [FEAT] 密码框新增可见性切换（眼睛）与大写锁定（Caps Lock）提示 —— 后者是输错密码的高频原因。
+ * - [FEAT] 新增关闭按钮（仅非初始化模式显示，初始化流程必须走完），Esc 仍可关闭。
+ * - [UI]  错误提示统一成带图标的提示气泡（红=组件异常 / 琥珀=服务端判定），替代原来的裸文字红字；
+ *         「人机验证自检」入口改为整行按钮，提交按钮加载态保留文案（正在验证…）+ spinner。
+ * - [FIX] 关闭 / 打开弹窗时复位 pwdVisible 与 capsOn，避免状态残留。
+ * - [FIX] Turnstile「配了验证却提示未通过」：页面里的 TURNSTILE_CFG 是服务端渲染时写死的，
+ *         保存密钥后不刷新页面就会「服务端已启用、页面仍以为没启用」→ 验证框不渲染 → 无 token → 403 死循环。
+ *         新增公开端点 GET /api/turnstile/config，登录弹窗每次打开实时拉取配置并动态补加载 api.js；
+ *         保存 / 清空密钥后立即生效。403 响应补可读 message 与错误码，登录弹窗常驻展示。
  *
  * Changelog (v22.8 Click Fix Edition):
  * - [FIX]  「点击登录按钮没有反应」：v22.7 把登录弹窗改成 x-if 按需渲染后引入的回归。
@@ -126,7 +141,7 @@
  */
 
 // 🟢 版本号单一来源：页脚、导出备份、Service Worker 缓存名都由它派生
-const APP_VERSION = "22.8";
+const APP_VERSION = "22.9";
 
 // 🟢 配置区域
 const SITE_ICON = "https://jhtvm.eu.org/rest/2Riuc1k.png"; 
@@ -267,6 +282,37 @@ const HTML_TEMPLATE = (context) => `
            （_x_toggleAndCascadeWithTransitions 是唯一的 .in() 调用点）。
            所以按需渲染的弹窗改用纯 CSS 动画：节点插入即自动播放，不需要 JS 参与。 */
         .modal-pop { animation: menuPop 0.15s ease-out; }
+
+        /* 🟢 登录弹窗专用样式（v22.9）
+           目标：与全站的「玻璃面板 + 强调色」语言完全一致 ——
+           徽标沿用顶部栏的 indigo→purple 渐变与 fa-atom，输入框改为左侧图标 + 左对齐，
+           所有错误提示统一成带图标的提示气泡，避免出现「裸文字红字」这种不一致的元素。 */
+        .auth-card { box-shadow: 0 24px 60px rgba(0, 0, 0, 0.38); }
+        .light-theme .auth-card { box-shadow: 0 24px 60px rgba(15, 23, 42, 0.16); }
+        /* 顶部一层柔光，让弹窗上半部分不至于死板 */
+        .auth-glow { position: absolute; top: -80px; left: 50%; transform: translateX(-50%); width: 280px; height: 190px; background: radial-gradient(closest-side, rgba(129, 140, 248, 0.3), transparent); pointer-events: none; }
+        .light-theme .auth-glow { background: radial-gradient(closest-side, rgba(79, 70, 229, 0.16), transparent); }
+        .auth-badge { background: linear-gradient(135deg, #6366f1, #8b5cf6 55%, #a855f7); box-shadow: 0 8px 24px rgba(99, 102, 241, 0.35), inset 0 1px 1px rgba(255, 255, 255, 0.35); }
+        .auth-close { color: var(--text-secondary); }
+        .auth-close:hover { background: rgba(148, 163, 184, 0.18); color: var(--text-primary); }
+        .auth-field { position: relative; }
+        .auth-field-icon { position: absolute; left: 15px; top: 50%; transform: translateY(-50%); font-size: 13px; color: var(--text-secondary); opacity: 0.6; pointer-events: none; transition: color 0.25s, opacity 0.25s; }
+        .auth-field:focus-within .auth-field-icon { color: var(--text-accent); opacity: 1; }
+        .auth-input { padding-left: 43px; }
+        .auth-input-pwd { padding-right: 45px; }
+        .auth-eye { position: absolute; right: 7px; top: 50%; transform: translateY(-50%); width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); opacity: 0.6; transition: all 0.2s; }
+        .auth-eye:hover { opacity: 1; background: rgba(148, 163, 184, 0.18); }
+        .auth-hint { display: flex; align-items: flex-start; gap: 7px; font-size: 11px; line-height: 1.65; padding: 9px 11px; border-radius: 11px; text-align: left; }
+        .auth-hint i { margin-top: 2px; flex-shrink: 0; }
+        .auth-hint span { flex: 1; min-width: 0; word-break: break-word; }
+        .auth-hint-error { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.22); color: #f87171; }
+        .light-theme .auth-hint-error { color: #dc2626; }
+        .auth-hint-warn { background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.22); color: #fbbf24; }
+        .light-theme .auth-hint-warn { color: #b45309; }
+        /* 提交按钮：hover 时一道微光扫过，和卡片顶部光带呼应 */
+        .auth-submit { position: relative; overflow: hidden; }
+        .auth-submit::after { content: ''; position: absolute; top: 0; left: -140%; width: 55%; height: 100%; background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.3), transparent); transition: left 0.55s ease; pointer-events: none; }
+        .auth-submit:hover::after { left: 140%; }
         .menu-item { padding: 8px 12px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-primary); }
         .menu-item:hover { background: var(--text-accent); color: white; }
         .menu-item.danger:hover { background: #ef4444; }
@@ -424,20 +470,49 @@ const HTML_TEMPLATE = (context) => `
          @click.self 只认「点到遮罩本身」，不注册任何全局监听，从根上避开这个时序陷阱。 -->
     <template x-if="modals.login">
         <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 modal-pop" @click.self="!needsSetup && closeLogin()">
-            <div class="glass-panel p-8 rounded-2xl w-full max-w-sm relative overflow-hidden" style="background: var(--modal-bg)">
+            <div class="glass-panel auth-card rounded-3xl w-full max-w-[360px] relative overflow-hidden" style="background: var(--modal-bg)">
+                <div class="auth-glow"></div>
                 <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 to-purple-500"></div>
-                <h2 class="text-xl font-bold mb-6 text-center" style="color: var(--text-primary)" x-text="needsSetup ? '初始化管理员' : '身份验证'"></h2>
-                <form @submit.prevent="handleAuth">
-                    <input type="text" x-model="authForm.username" autocomplete="username" placeholder="用户名" class="search-input w-full mb-3 p-3.5 rounded-xl text-center" required>
-                    <input type="password" x-model="authForm.password" autocomplete="current-password" placeholder="密码" class="search-input w-full p-3.5 rounded-xl text-center" :class="tsCfg.enabled ? 'mb-4' : 'mb-8'" required>
-                    <div x-show="tsCfg.enabled" class="mb-4">
-                        <div x-ref="tsBox" class="flex justify-center min-h-[65px]"></div>
-                        <p x-show="tsError" class="text-[11px] text-red-400 text-center mt-2 leading-relaxed" x-text="tsError"></p>
-                        <p x-show="tsServerMsg" class="text-[11px] text-amber-400 text-center mt-2 leading-relaxed" x-text="tsServerMsg"></p>
-                        <button type="button" x-show="tsError || tsServerMsg" @click="openDiagnose()" class="block mx-auto mt-2 text-[11px] underline opacity-60 hover:opacity-100 transition" style="color: var(--text-secondary)">人机验证自检（无需登录）</button>
+                <button type="button" x-show="!needsSetup" @click="closeLogin()" aria-label="关闭" title="关闭 (Esc)" class="auth-close absolute top-3 right-3 w-8 h-8 rounded-full flex items-center justify-center transition z-10"><i class="fa-solid fa-xmark text-sm"></i></button>
+
+                <div class="relative px-7 pt-7 pb-7">
+                    <!-- 品牌区：沿用顶部栏那枚徽标的语言（fa-atom + indigo→purple 渐变），
+                         让弹窗一眼看上去就属于这个站点，而不是一个孤立的表单。 -->
+                    <div class="flex flex-col items-center text-center mb-6">
+                        <div class="auth-badge w-14 h-14 rounded-2xl flex items-center justify-center text-white shrink-0 ring-1 ring-white/20 mb-3.5"><i class="fa-solid fa-atom text-2xl"></i></div>
+                        <h2 class="text-lg font-bold tracking-tight" style="color: var(--text-primary)" x-text="needsSetup ? '初始化管理员' : '欢迎回来'"></h2>
+                        <p class="text-[11px] leading-relaxed mt-1.5 max-w-[250px]" style="color: var(--text-secondary)" x-text="needsSetup ? '创建第一个管理员账号，用于管理导航、便签与设置' : '登录后可编辑导航、使用便签并云端同步'"></p>
                     </div>
-                    <button type="submit" class="w-full py-3.5 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold shadow-lg shadow-indigo-500/20 transition transform active:scale-95 disabled:opacity-50" :disabled="status.submitting"><span x-show="!status.submitting" x-text="needsSetup ? '系统初始化' : '登录控制台'"></span><span x-show="status.submitting"><i class="fa-solid fa-circle-notch fa-spin"></i></span></button>
-                </form>
+
+                    <form @submit.prevent="handleAuth" class="space-y-3">
+                        <div class="auth-field">
+                            <i class="fa-solid fa-user auth-field-icon"></i>
+                            <input type="text" x-model="authForm.username" autocomplete="username" aria-label="用户名" placeholder="用户名" class="search-input auth-input w-full py-3.5 rounded-xl text-sm" required>
+                        </div>
+                        <div class="auth-field">
+                            <i class="fa-solid fa-lock auth-field-icon"></i>
+                            <input :type="pwdVisible ? 'text' : 'password'" x-model="authForm.password" autocomplete="current-password" aria-label="密码" placeholder="密码" class="search-input auth-input auth-input-pwd w-full py-3.5 rounded-xl text-sm" required @keyup="checkCaps($event)" @keydown="checkCaps($event)">
+                            <button type="button" @click="pwdVisible = !pwdVisible" aria-label="显示或隐藏密码" tabindex="-1" class="auth-eye"><i class="fa-solid text-xs" :class="pwdVisible ? 'fa-eye-slash' : 'fa-eye'"></i></button>
+                        </div>
+
+                        <p x-show="capsOn" class="auth-hint auth-hint-warn"><i class="fa-solid fa-triangle-exclamation"></i><span>大写锁定（Caps Lock）已开启</span></p>
+
+                        <div x-show="tsCfg.enabled" class="pt-0.5">
+                            <div x-ref="tsBox" class="flex justify-center min-h-[65px]"></div>
+                        </div>
+
+                        <div x-show="tsError" class="auth-hint auth-hint-error"><i class="fa-solid fa-circle-exclamation"></i><span x-text="tsError"></span></div>
+                        <div x-show="tsServerMsg" class="auth-hint auth-hint-warn"><i class="fa-solid fa-circle-info"></i><span x-text="tsServerMsg"></span></div>
+                        <button type="button" x-show="tsError || tsServerMsg" @click="openDiagnose()" class="block w-full text-[11px] underline decoration-dotted underline-offset-2 opacity-60 hover:opacity-100 transition" style="color: var(--text-secondary)">运行人机验证自检（无需登录）</button>
+
+                        <button type="submit" class="auth-submit w-full py-3.5 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-sm font-bold shadow-lg shadow-indigo-500/25 transition transform active:scale-[0.98] disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2" :disabled="status.submitting">
+                            <i x-show="status.submitting" class="fa-solid fa-circle-notch fa-spin"></i>
+                            <span x-text="status.submitting ? (needsSetup ? '正在初始化…' : '正在验证…') : (needsSetup ? '创建并进入' : '登录控制台')"></span>
+                        </button>
+                    </form>
+
+                    <p class="text-[10px] leading-relaxed text-center mt-4" style="color: var(--text-secondary)" x-text="needsSetup ? '这是首次设置，凭据会保存到你自己的 Cloudflare R2，请妥善保管。' : '凭据仅保存在你自己的 Cloudflare 部署中，不会上传到第三方。'"></p>
+                </div>
             </div>
         </div>
     </template>
@@ -591,6 +666,8 @@ const HTML_TEMPLATE = (context) => `
                     { name: '自定义', val: 'custom', icon: 'fa-solid fa-wand-magic-sparkles', url: '' }
                 ],
                 authForm: { username: '', password: '' }, linkForm: { id: null, groupId: null, title: '', url: '', desc: '', iconUrl: '', isPrivate: false }, groupForm: { id: null, name: '', isPrivate: false },
+                // 🟢 登录弹窗的交互状态：密码可见性 + 大写锁定提示
+                pwdVisible: false, capsOn: false,
                 
                 zenTimer: null,
                 sortableInstances: [], 
@@ -1055,9 +1132,13 @@ const HTML_TEMPLATE = (context) => `
                 askConfirm(message, onOk, opts = {}) { this.confirmBox = { show: true, title: opts.title || '请确认', message, okText: opts.okText || '确认', danger: opts.danger !== false, onOk }; },
                 doConfirm() { const fn = this.confirmBox.onOk; this.confirmBox.show = false; if (typeof fn === 'function') fn(); },
 
+                // 🟢 登录弹窗：大写锁定提示（getModifierState 在个别浏览器/输入法下可能缺失，故 try 兜底）
+                checkCaps(e) { try { this.capsOn = !!(e.getModifierState && e.getModifierState('CapsLock')); } catch (err) { this.capsOn = false; } },
+
                 // 🟢 Turnstile：登录页组件渲染 / 重置
                 async openLogin() {
                     this.modals.login = true; this.tsServerMsg = '';
+                    this.pwdVisible = false; this.capsOn = false;
                     await this.refreshTsCfg();       // 先拉一次实时配置，见下方注释
                     this.ensureTsScript();
                     this.$nextTick(() => this.renderTurnstile());
@@ -1098,6 +1179,7 @@ const HTML_TEMPLATE = (context) => `
                     this.tsWidgetId = null;
                     if (this.tsPollTimer) { clearInterval(this.tsPollTimer); this.tsPollTimer = null; }
                     this.turnstileToken = ''; this.tsError = ''; this.tsServerMsg = '';
+                    this.pwdVisible = false; this.capsOn = false;
                 },
                 tsHint(code) { const m = { '110100': 'Site Key 无效或格式错误', '400020': 'Site Key 无效或填反了（Site Key / Secret Key 不要互换）', '110110': 'Site Key 不存在或不属于当前账号', '110200': '当前域名未在 widget 的 Hostname Management 中授权（workers.dev 需显式添加）', '400021': '域名与 Site Key 不匹配', '110500': '组件模式不匹配（应为 Managed）', '110600': '验证超时，请刷新重试', '400070': 'Site Key 已停用' }; return '人机验证组件异常：' + (m[String(code)] || ('错误码 ' + code)); },
                 renderTurnstile() {
