@@ -3,12 +3,12 @@
  *
  * Changelog (v22.7 Autofill Off Edition):
  * - [FIX]  「每次刷新账号被填进搜索框」的**根因**：登录弹窗原本用 x-show 隐藏，
- *          也就是那个 <input type="password"> 一直常驻在 DOM 里。Chrome 的密码管理器
+ *          也就是那个密码输入框（type="password"）一直常驻在 DOM 里。Chrome 的密码管理器
  *          一旦在页面上扫到密码框，就会去找一个「用户名输入框」去填 —— 而隐藏字段会被它跳过，
  *          于是它挑中了页面上第一个可见文本框：顶部搜索框。
  *          现在登录弹窗改成 <template x-if="modals.login"> 按需渲染：不打开时整块 DOM 都不存在，
  *          浏览器根本无从下手。配套新增 closeLogin()，关闭时同步摘掉 Turnstile 组件并复位 widgetId。
- *          系统设置面板同理（里面有一个 <input type="password"> 用于 Turnstile Secret Key），
+ *          系统设置面板同理（里面有一个填 Turnstile Secret Key 的密码输入框），
  *          一并改成 x-if。改完之后，页面在「用户没有主动打开凭据弹窗」时，DOM 里
  *          不存在任何 type="password"，浏览器彻底失去自动填充的触发点。
  *          （此前的 autocomplete="off" / data-lpignore 等静态属性只能治标，改不掉「密码框常驻」这个病根。）
