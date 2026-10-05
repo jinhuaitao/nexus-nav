@@ -1,7 +1,22 @@
 /**
- * Cloudflare Worker Navigation Site v22.3 (Feature Completion Edition)
+ * Cloudflare Worker Navigation Site v22.4 (Polish Edition)
  *
- * Changelog (v22.3):
+ * Changelog (v22.4):
+ * - [FEAT] PWA Service Worker：新增 /sw.js，仅对白名单 CDN 做「网络优先 + 缓存兜底」，
+ *          同源 HTML / API 一律不拦截、绝不缓存，避免读到过期内容或他人数据。
+ * - [SEC] 登录失败限流：同一 IP 10 分钟内失败 8 次即临时锁定（429），登录成功后清零。
+ * - [SEC] 口令哈希改为恒定时间比较，避免通过响应耗时推测。
+ * - [SEC] 所有 API 响应加 Cache-Control: no-store；HTML 加 no-cache，避免私密数据被缓存或读到旧页面。
+ * - [HARD] /api/data 写入增加 4MB 体积上限与 JSON 校验；/api/meta 抓取失败改回 502。
+ * - [FEAT] 图标抓取优先取 <link rel="icon">，其次 og:image；相对路径自动补全为绝对地址。
+ * - [FEAT] 用应用内确认弹窗替换原生 confirm()，风格统一；设置页新增「恢复默认」。
+ * - [FIX]  Toast 计时器未清理，连续提示时前一条会提前关掉后一条。
+ * - [FIX]  图标兜底不再无限递归（先置 onerror=null），兜底图改用标题首字母。
+ * - [FIX]  登录过期提示区分「已登出」与「登录已过期」；备份文件带日期与元信息，导入时校验结构。
+ * - [FIX]  保存链接/分组补充校验与错误提示（空网址、非法网址、空分组名）。
+ * - [SYNC] 版本号在 Worker 头部 / 页脚 / package.json 三处对齐。
+ *
+ * Changelog (v22.3 Feature Completion Edition):
  * - [FEAT] 搜索框即时本地筛选：按分组名 / 标题 / 描述 / 网址过滤，原 getter 直接返回全部导致筛选形同虚设。
  * - [FEAT] 补齐「自定义搜索引擎」：新增引擎选项 + 设置项 + 占位符提示，原 customSearchUrl 是永不生效的死代码。
  * - [FEAT] 新建/编辑链接新增「所属分组」下拉，原实现无法在弹窗内改分组。
@@ -37,6 +52,34 @@
 
 // 🟢 配置区域
 const SITE_ICON = "https://jhtvm.eu.org/rest/2Riuc1k.png"; 
+
+// 🟢 Service Worker（PWA）：仅对白名单 CDN 做「网络优先 + 缓存兜底」，
+// 同源资源（HTML / API / manifest）一律不拦截、绝不缓存，避免读到过期或他人数据。
+const SW_VERSION = "v22.4";
+const SW_SOURCE = `
+const CACHE = "nexus-static-${SW_VERSION}";
+const CDN_HOSTS = ["cdn.jsdelivr.net", "cdnjs.cloudflare.com", "fonts.googleapis.com", "fonts.gstatic.com", "cdn.tailwindcss.com"];
+self.addEventListener("install", () => { self.skipWaiting(); });
+self.addEventListener("activate", (e) => {
+  e.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+});
+self.addEventListener("fetch", (e) => {
+  const req = e.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  if (url.origin === self.location.origin) return;
+  if (CDN_HOSTS.indexOf(url.hostname) === -1) return;
+  e.respondWith(
+    fetch(req)
+      .then((res) => { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {}); return res; })
+      .catch(() => caches.match(req))
+  );
+});
+`;
 
 const HTML_TEMPLATE = (context) => `
 <!DOCTYPE html>
@@ -209,7 +252,7 @@ const HTML_TEMPLATE = (context) => `
                             
                             <template x-for="link in group.items" :key="link.id">
                                 <div class="nav-card rounded-xl p-3.5 flex items-center gap-3 cursor-pointer select-none h-full group relative" :data-id="link.id" @click="!editMode && openLink(link.url)" @contextmenu.prevent.stop="showContextMenu($event, link, group.id)">
-                                    <img :src="link.iconUrl || getFavicon(link.url)" class="link-icon rounded-lg bg-gray-500/5 p-0.5" loading="lazy" onerror="this.src='https://ui-avatars.com/api/?name=Lk&background=random&color=fff&rounded=true&size=32'">
+                                    <img :src="link.iconUrl || getFavicon(link.url)" class="link-icon rounded-lg bg-gray-500/5 p-0.5" loading="lazy" @error="fallbackIcon($event, link)">
                                     <div class="min-w-0 flex-1 relative">
                                         <div class="font-semibold text-[13px] truncate leading-tight mb-0.5 flex items-center gap-1.5" style="color: var(--text-primary)"><span x-text="link.title"></span><i x-show="link.isPrivate" class="fa-solid fa-lock text-[8px] text-amber-500"></i></div>
                                         <div class="text-[10px] truncate opacity-60 font-medium" style="color: var(--text-secondary)" x-text="link.desc || getDomain(link.url)"></div>
@@ -228,7 +271,7 @@ const HTML_TEMPLATE = (context) => `
         </div>
     </main>
     
-    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.3</a></footer>
+    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.4</a></footer>
 
     <div x-show="menu.show" :style="\`top: \${menu.y}px; left: \${menu.x}px\`" class="context-menu" @click.outside="closeMenu()" x-cloak>
         <div class="menu-item" @click="menuEdit()"><i class="fa-solid fa-pen w-4 opacity-60"></i> 编辑</div>
@@ -323,7 +366,17 @@ const HTML_TEMPLATE = (context) => `
                     <div class="flex gap-3"><button @click="exportData()" class="flex-1 py-3 rounded-xl bg-blue-500/10 hover:bg-blue-500/20 text-blue-500 text-xs font-bold transition border border-blue-500/20"><i class="fa-solid fa-download mr-1"></i> 备份</button><label class="flex-1 py-3 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 text-xs font-bold text-center cursor-pointer transition border border-emerald-500/20"><i class="fa-solid fa-upload mr-1"></i> 恢复<input type="file" class="hidden" accept=".json" @change="importData($event)"></label></div>
                 </div>
             </div>
-            <button @click="saveSettings(); modals.settings=false" class="w-full mt-6 py-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold shadow-lg shadow-indigo-500/20 transition">保存更改</button>
+            <div class="flex gap-3 mt-6"><button @click="resetSettings()" class="px-5 py-3.5 rounded-xl bg-gray-500/10 hover:bg-gray-500/20 text-sm font-bold transition" style="color: var(--text-secondary)">恢复默认</button><button @click="saveSettings(); modals.settings=false" class="flex-1 py-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold shadow-lg shadow-indigo-500/20 transition">保存更改</button></div>
+        </div>
+    </div>
+
+    <div x-show="confirmBox.show" class="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" x-cloak x-transition.opacity>
+        <div class="glass-panel p-6 rounded-2xl w-full max-w-sm" style="background: var(--modal-bg)" @click.away="confirmBox.show = false">
+            <div class="flex items-start gap-3 mb-5">
+                <div class="w-9 h-9 rounded-full flex items-center justify-center shrink-0" :class="confirmBox.danger ? 'bg-red-500/15 text-red-500' : 'bg-indigo-500/15 text-indigo-400'"><i class="fa-solid" :class="confirmBox.danger ? 'fa-triangle-exclamation' : 'fa-circle-question'"></i></div>
+                <div class="min-w-0"><h3 class="text-base font-bold mb-1" style="color: var(--text-primary)" x-text="confirmBox.title"></h3><p class="text-sm leading-relaxed break-words" style="color: var(--text-secondary)" x-text="confirmBox.message"></p></div>
+            </div>
+            <div class="flex gap-3"><button @click="confirmBox.show = false" class="flex-1 py-2.5 rounded-xl bg-gray-500/10 hover:bg-gray-500/20 transition text-sm font-medium" style="color: var(--text-secondary)">取消</button><button @click="doConfirm()" class="flex-1 py-2.5 rounded-xl text-white text-sm font-bold shadow-lg transition" :class="confirmBox.danger ? 'bg-red-600 hover:bg-red-500 shadow-red-500/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-500/20'" x-text="confirmBox.okText"></button></div>
         </div>
     </div>
 
@@ -343,6 +396,8 @@ const HTML_TEMPLATE = (context) => `
                 modals: { login: false, link: false, group: false, settings: false, memo: false },
                 menu: { show: false, x: 0, y: 0, targetLink: null, targetGroupId: null },
                 toast: { show: false, msg: '', type: 'success' },
+                toastTimer: null,
+                confirmBox: { show: false, title: '', message: '', okText: '确认', danger: true, onOk: null },
                 settings: { bgType: 'bing', customBg: '', blur: 0, engine: 'google', customSearchUrl: '', showBgInLight: false, iconSize: 32, layoutWidth: 'center', iconOpacity: 100, cardOpacity: 40, headerOpacity: 75, memo: '' },
                 engines: [
                     { name: 'Google', val: 'google', icon: 'fa-brands fa-google', url: 'https://www.google.com/search?q=' },
@@ -419,7 +474,7 @@ const HTML_TEMPLATE = (context) => `
                     if (e.key === 'Z' && e.shiftKey) { this.toggleZen(); }
                     if (e.key === 'N' && e.shiftKey && this.isLoggedIn) { this.modals.memo = true; }
                 },
-                closeAllModals() { this.modals.login = false; this.modals.link = false; this.modals.group = false; this.modals.settings = false; this.modals.memo = false; this.closeMenu(); },
+                closeAllModals() { this.modals.login = false; this.modals.link = false; this.modals.group = false; this.modals.settings = false; this.modals.memo = false; this.confirmBox.show = false; this.closeMenu(); },
                 toggleZen() { this.zenMode = !this.zenMode; },
                 
                 toggleEditMode() {
@@ -578,19 +633,21 @@ const HTML_TEMPLATE = (context) => `
                 menuEdit() { this.linkForm = { ...this.menu.targetLink, groupId: this.menu.targetGroupId }; this.modals.link = true; this.closeMenu(); },
                 menuCopy() { const url = this.menu.targetLink && this.menu.targetLink.url; if(!url) { this.closeMenu(); return; } const done = () => { this.showToast('链接已复制'); this.closeMenu(); }; if(navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(url).then(done).catch(() => { this.copyFallback(url); done(); }); } else { this.copyFallback(url); done(); } },
                 copyFallback(text) { try { const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.focus(); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); } catch(e) {} },
-                async deleteLink(linkId, groupId) { if(!confirm('确定删除?')) return; const group = this.groups.find(g => String(g.id) === String(groupId)); if(group) { group.items = group.items.filter(i => String(i.id) !== String(linkId)); await this.saveAll(); this.modals.link = false; this.closeMenu(); this.showToast('已删除'); } },
+                async deleteLink(linkId, groupId) { this.askConfirm('删除后不可恢复，确定移除该链接？', async () => { const group = this.groups.find(g => String(g.id) === String(groupId)); if(group) { group.items = group.items.filter(i => String(i.id) !== String(linkId)); await this.saveAll(); this.modals.link = false; this.closeMenu(); this.showToast('已删除'); } }, { okText: '移除' }); },
 
                 openLinkModal(groupId = null) { const defaultGroup = groupId || (this.groups.length > 0 ? this.groups[0].id : null); if(!defaultGroup && !groupId) return this.showToast('请先创建分组', 'error'); this.linkForm = { id: null, groupId: defaultGroup, title: '', url: '', desc: '', iconUrl: '', isPrivate: false }; this.modals.link = true; },
                 async fetchMetadata() { if(!this.linkForm.url || this.linkForm.title || this.status.fetchingMeta) return; if (!this.linkForm.url.startsWith('http')) this.linkForm.url = 'https://' + this.linkForm.url; this.status.fetchingMeta = true; try { const res = await fetch('/api/meta?url=' + encodeURIComponent(this.linkForm.url)); if(res.ok) { const data = await res.json(); if(data.title) this.linkForm.title = data.title; if(data.description && !this.linkForm.desc) this.linkForm.desc = data.description.substring(0, 50); if(!this.linkForm.iconUrl) this.linkForm.iconUrl = data.icon || \`https://icons.duckduckgo.com/ip3/\${new URL(this.linkForm.url).hostname}.ico\`; } } catch(e) {} this.status.fetchingMeta = false; },
                 
                 // 🟢 FIXED: In-Place Edit
                 saveLink() { 
-                    if(!this.linkForm.url) return;
+                    if(!this.linkForm.url) return this.showToast('请填写网址', 'error');
                     if(!this.linkForm.url.startsWith('http')) this.linkForm.url = 'https://' + this.linkForm.url;
+                    let fallbackTitle = this.linkForm.url;
+                    try { fallbackTitle = new URL(this.linkForm.url).hostname; } catch(e) { this.showToast('网址格式不正确', 'error'); return; }
                     
                     const newItem = {
                         id: this.linkForm.id || Date.now().toString(),
-                        title: this.linkForm.title || new URL(this.linkForm.url).hostname,
+                        title: this.linkForm.title || fallbackTitle,
                         url: this.linkForm.url,
                         desc: this.linkForm.desc,
                         iconUrl: this.linkForm.iconUrl,
@@ -626,7 +683,7 @@ const HTML_TEMPLATE = (context) => `
 
                 openGroupModal() { this.groupForm = { id: null, name: '', isPrivate: false }; this.modals.group = true; }, editGroup(g) { this.groupForm = { ...g }; this.modals.group = true; },
                 saveGroup() { 
-                    if(!this.groupForm.name) return; 
+                    if(!this.groupForm.name) return this.showToast('请填写分组名称', 'error'); 
                     if(this.groupForm.id) { 
                         const g = this.groups.find(x => String(x.id) === String(this.groupForm.id)); 
                         if(g) { g.name = this.groupForm.name; g.isPrivate = this.groupForm.isPrivate; } 
@@ -636,9 +693,9 @@ const HTML_TEMPLATE = (context) => `
                     } 
                     this.saveAll(); this.modals.group = false; 
                 },
-                deleteGroup() { if(!confirm('删除此分组及所有内容?')) return; this.groups = this.groups.filter(x => String(x.id) !== String(this.groupForm.id)); this.saveAll(); this.modals.group = false; },
+                deleteGroup() { this.askConfirm('该分组及其中的全部链接都会被删除，且不可恢复。', () => { this.groups = this.groups.filter(x => String(x.id) !== String(this.groupForm.id)); this.saveAll(); this.modals.group = false; this.showToast('分组已删除'); }, { okText: '删除分组' }); },
 
-                async syncData(method, payload = null) { const headers = { 'Content-Type': 'application/json' }; if(this.token) headers['Authorization'] = this.token; if(method === 'POST') this.status.saving = true; try { const res = await fetch('/api/data', { method, headers, body: payload ? JSON.stringify(payload) : null }); if(res.status === 401) { this.logout(); return; } if(method === 'GET') { const data = await res.json(); const raw = Array.isArray(data.data) ? data.data : []; this.groups = (raw.length > 0 && raw[0] && !raw[0].items) ? [{ id: 'default', name: 'Home', isPrivate: false, items: raw }] : raw; if(data.settings && this.token) { this.settings = { ...this.settings, ...data.settings }; this.updateCSSVars(); } this.sanitizeData(this.groups); } else { this.status.pending = false; } } catch(e) { if(method === 'POST') this.status.pending = true; } finally { this.status.saving = false; } },
+                async syncData(method, payload = null) { const headers = { 'Content-Type': 'application/json' }; if(this.token) headers['Authorization'] = this.token; if(method === 'POST') this.status.saving = true; try { const res = await fetch('/api/data', { method, headers, body: payload ? JSON.stringify(payload) : null }); if(res.status === 401) { this.logout('登录已过期，请重新登录'); return; } if(method === 'GET') { const data = await res.json(); const raw = Array.isArray(data.data) ? data.data : []; this.groups = (raw.length > 0 && raw[0] && !raw[0].items) ? [{ id: 'default', name: 'Home', isPrivate: false, items: raw }] : raw; if(data.settings && this.token) { this.settings = { ...this.settings, ...data.settings }; this.updateCSSVars(); } this.sanitizeData(this.groups); } else { this.status.pending = false; } } catch(e) { if(method === 'POST') this.status.pending = true; } finally { this.status.saving = false; } },
                 
                 saveAll() { 
                     if(this.isLoggedIn) { 
@@ -656,9 +713,9 @@ const HTML_TEMPLATE = (context) => `
                 }, 
                 async saveSettings() { await this.saveAll(); },
                 async checkStatus() { try { const res = await fetch('/api/status'); this.needsSetup = !(await res.json()).setup; if(this.needsSetup) this.modals.login = true; } catch(e) {} },
-                async handleAuth() { this.status.submitting = true; const endpoint = this.needsSetup ? '/api/setup' : '/api/login'; try { const res = await fetch(endpoint, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(this.authForm) }); if(res.ok) { const data = await res.json(); this.token = data.token; localStorage.setItem('nexus_token', this.token); this.isLoggedIn = true; this.modals.login = false; this.needsSetup = false; this.syncData('GET'); this.showToast('欢迎回来'); setTimeout(() => { this.initGroupSortable(); this.updateSortableState(); }, 500); } else { this.showToast('验证失败', 'error'); } } catch(e) {} this.status.submitting = false; },
-                async verifyToken() { const res = await fetch('/api/check', { headers: { 'Authorization': this.token } }); if(!res.ok) this.logout(); else this.isLoggedIn = true; },
-                logout() { try { if(this.token) fetch('/api/logout', { method: 'POST', headers: { 'Authorization': this.token } }); } catch(e) {} this.token = null; localStorage.removeItem('nexus_token'); this.isLoggedIn = false; this.editMode = false; this.groups = []; this.syncData('GET'); this.showToast('已登出'); },
+                async handleAuth() { this.status.submitting = true; const endpoint = this.needsSetup ? '/api/setup' : '/api/login'; try { const res = await fetch(endpoint, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(this.authForm) }); if(res.ok) { const data = await res.json(); this.token = data.token; localStorage.setItem('nexus_token', this.token); this.isLoggedIn = true; this.modals.login = false; this.needsSetup = false; this.authForm.password = ''; this.syncData('GET'); this.showToast('欢迎回来'); setTimeout(() => { this.initGroupSortable(); this.updateSortableState(); }, 500); } else if (res.status === 429) { this.showToast('尝试次数过多，请稍后再试', 'error'); this.authForm.password = ''; } else if (res.status === 403) { this.showToast('系统已初始化，请直接登录', 'error'); this.needsSetup = false; } else { this.showToast('用户名或密码错误', 'error'); this.authForm.password = ''; } } catch(e) { this.showToast('网络异常，请稍后重试', 'error'); } this.status.submitting = false; },
+                async verifyToken() { const res = await fetch('/api/check', { headers: { 'Authorization': this.token } }); if(!res.ok) this.logout('登录已过期，请重新登录'); else this.isLoggedIn = true; },
+                logout(msg = '已登出') { try { if(this.token) fetch('/api/logout', { method: 'POST', headers: { 'Authorization': this.token } }); } catch(e) {} this.token = null; localStorage.removeItem('nexus_token'); this.isLoggedIn = false; this.editMode = false; this.groups = []; this.syncData('GET'); this.showToast(msg); },
 
                 doSearch() {
                     const q = (this.search || '').trim();
@@ -670,8 +727,13 @@ const HTML_TEMPLATE = (context) => `
                     if (!base) { this.showToast('请先在「系统设置」填写自定义搜索地址', 'error'); return; }
                     window.open(base + encodeURIComponent(q), '_blank', 'noopener,noreferrer');
                 },
-                getFavicon(url) { try { return \`https://icons.duckduckgo.com/ip3/\${new URL(url).hostname}.ico\`; } catch { return ''; } }, getDomain(url) { try { return new URL(url).hostname; } catch { return ''; } }, openLink(url) { window.open(url, '_blank', 'noopener,noreferrer'); }, showToast(msg, type='success') { this.toast.msg = msg; this.toast.type = type; this.toast.show = true; setTimeout(() => this.toast.show = false, 2500); },
-                exportData() { const blob = new Blob([JSON.stringify({ data: this.groups, settings: this.settings })], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = "nexus_backup.json"; a.click(); },
+                getFavicon(url) { try { return \`https://icons.duckduckgo.com/ip3/\${new URL(url).hostname}.ico\`; } catch { return ''; } }, getDomain(url) { try { return new URL(url).hostname; } catch { return ''; } }, openLink(url) { window.open(url, '_blank', 'noopener,noreferrer'); },
+                fallbackIcon(e, link) { const img = e.target; img.onerror = null; const ch = (String((link && link.title) || '?').trim().charAt(0)) || '?'; img.src = 'https://ui-avatars.com/api/?name=' + encodeURIComponent(ch) + '&background=random&color=fff&rounded=true&size=64'; },
+                showToast(msg, type='success') { this.toast.msg = msg; this.toast.type = type; this.toast.show = true; if (this.toastTimer) clearTimeout(this.toastTimer); this.toastTimer = setTimeout(() => { this.toast.show = false; }, 2500); },
+                askConfirm(message, onOk, opts = {}) { this.confirmBox = { show: true, title: opts.title || '请确认', message, okText: opts.okText || '确认', danger: opts.danger !== false, onOk }; },
+                doConfirm() { const fn = this.confirmBox.onOk; this.confirmBox.show = false; if (typeof fn === 'function') fn(); },
+                exportData() { const blob = new Blob([JSON.stringify({ version: 'v22.4', exportedAt: new Date().toISOString(), data: this.groups, settings: this.settings }, null, 2)], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'nexus_backup_' + new Date().toISOString().slice(0, 10) + '.json'; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch(e) {} }, 1000); this.showToast('备份已导出'); },
+                resetSettings() { this.askConfirm('将把背景 / 布局 / 外观等设置恢复为默认值（不会删除任何链接），确定继续？', () => { this.settings = { ...this.settings, bgType: 'bing', customBg: '', blur: 0, engine: 'google', customSearchUrl: '', showBgInLight: false, iconSize: 32, layoutWidth: 'center', iconOpacity: 100, cardOpacity: 40, headerOpacity: 75 }; this.updateCSSVars(); this.saveAll(); this.showToast('已恢复默认设置'); }, { okText: '恢复默认', danger: false }); },
                 
                 // 🟢 FIXED: Prevent browser "Reload site?" prompt by clearing saving status
                 importData(e) { 
@@ -679,23 +741,21 @@ const HTML_TEMPLATE = (context) => `
                     if (!file) return; 
                     const reader = new FileReader(); 
                     reader.onload = async (ev) => { 
-                        try { 
-                            const json = JSON.parse(ev.target.result); 
-                            if(json.data) this.groups = json.data; 
-                            if(json.settings) this.settings = json.settings; 
-                            
-                            await this.saveAll(); 
-                            this.showToast('恢复成功'); 
-                            
-                            setTimeout(() => { 
-                                // FORCE RESET STATUS
-                                this.status.pending = false; 
-                                this.status.saving = false; 
-                                location.reload(); 
-                            }, 1000); 
-                        } catch { 
-                            this.showToast('文件损坏', 'error'); 
-                        } 
+                        let json;
+                        try { json = JSON.parse(ev.target.result); } catch { return this.showToast('文件损坏或不是合法 JSON', 'error'); }
+                        if (!json || !Array.isArray(json.data)) return this.showToast('备份文件格式不正确（缺少 data 数组）', 'error');
+                        this.groups = json.data; 
+                        if (json.settings && typeof json.settings === 'object') this.settings = { ...this.settings, ...json.settings };
+                        this.sanitizeData(this.groups);
+                        this.updateCSSVars();
+                        await this.saveAll(); 
+                        this.showToast('恢复成功'); 
+                        setTimeout(() => { 
+                            // 清掉未保存状态，避免浏览器弹出「离开站点？」提示
+                            this.status.pending = false; 
+                            this.status.saving = false; 
+                            location.reload(); 
+                        }, 1000); 
                     }; 
                     reader.readAsText(file); 
                 },
@@ -731,6 +791,7 @@ const HTML_TEMPLATE = (context) => `
             }
         }
     </script>
+    <script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
 </body>
 </html>
 `;
@@ -759,7 +820,7 @@ async function verifyCreds(env, username, password) {
     const stored = storedObj ? await storedObj.json() : null;
     if (!stored || !stored.username || username !== stored.username) return null;
     const hashed = stored.salt ? await hashText(stored.salt + password) : await hashText(password);
-    return hashed === stored.password ? stored : null;
+    return safeEqual(hashed, stored.password) ? stored : null;
 }
 async function revokeSession(env, header) {
     if (header && header.startsWith('Bearer ')) {
@@ -767,6 +828,41 @@ async function revokeSession(env, header) {
         if (/^[a-f0-9]{64}$/.test(raw)) await env.NAV_R2.delete('session_' + raw);
     }
 }
+
+/** 恒定时间字符串比较，避免通过响应耗时推测口令哈希 */
+function safeEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+}
+
+// 🟢 登录限流：同一 IP 在窗口期内失败次数过多则临时锁定，缓解暴力破解
+const LOGIN_MAX_FAILS = 8;
+const LOGIN_WINDOW = 10 * 60 * 1000;
+async function checkLoginThrottle(env, ip) {
+    if (!ip) return { blocked: false };
+    const obj = await env.NAV_R2.get('login_fail_' + ip);
+    if (!obj) return { blocked: false };
+    try {
+        const s = await obj.json();
+        if (s && s.until > Date.now() && s.count >= LOGIN_MAX_FAILS) {
+            return { blocked: true, retryAfter: Math.ceil((s.until - Date.now()) / 1000) };
+        }
+    } catch { /* 记录损坏则视为未锁定 */ }
+    return { blocked: false };
+}
+async function recordLoginFail(env, ip) {
+    if (!ip) return;
+    const key = 'login_fail_' + ip;
+    let state = { count: 0, until: 0 };
+    const obj = await env.NAV_R2.get(key);
+    if (obj) { try { const p = await obj.json(); if (p && p.until > Date.now()) state = p; } catch { /* 忽略 */ } }
+    state.count = (state.count || 0) + 1;
+    state.until = Date.now() + LOGIN_WINDOW;
+    await env.NAV_R2.put(key, JSON.stringify(state));
+}
+async function clearLoginFails(env, ip) { if (ip) await env.NAV_R2.delete('login_fail_' + ip); }
 
 /** SSRF 防护：只放行 http/https，拦截 localhost / 内网 / 保留地址 */
 function isSafeTarget(rawUrl) {
@@ -795,7 +891,22 @@ function isSafeTarget(rawUrl) {
 
 class MetaHandler {
     constructor(state) { this.state = state; }
-    element(element) { if (element.tagName === "title" && !this.state.title) { this.state.inTitle = true; } if (element.tagName === "meta") { const name = element.getAttribute("name"); const prop = element.getAttribute("property"); const content = element.getAttribute("content"); if (name === "description" && content) this.state.description = content; if (prop === "og:image" && content) this.state.image = content; } }
+    element(element) {
+        const tag = element.tagName;
+        if (tag === "title" && !this.state.title) { this.state.inTitle = true; }
+        if (tag === "meta") {
+            const name = element.getAttribute("name"); const prop = element.getAttribute("property"); const content = element.getAttribute("content");
+            if (name === "description" && content) this.state.description = content;
+            if (prop === "og:image" && content) this.state.image = content;
+        }
+        if (tag === "link") {
+            const rel = (element.getAttribute("rel") || "").toLowerCase();
+            const href = element.getAttribute("href");
+            if (href && (rel === "icon" || rel === "shortcut icon" || rel === "apple-touch-icon" || rel === "apple-touch-icon-precomposed")) {
+                if (!this.state.icon) this.state.icon = href;
+            }
+        }
+    }
     text(text) { if (this.state.inTitle && text.text.trim()) { this.state.title = (this.state.title || "") + text.text; } }
     end(element) { if (element.tagName === "title") this.state.inTitle = false; }
 }
@@ -803,7 +914,7 @@ class MetaHandler {
 export default {
     async fetch(request, env) {
         const url = new URL(request.url); const path = url.pathname;
-        const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization", "Referrer-Policy": "no-referrer" };
+        const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store" };
         if (request.method === "OPTIONS") return new Response(null, { headers: cors });
 
         try {
@@ -832,10 +943,15 @@ export default {
                 return new Response(JSON.stringify(manifest), { headers: { "Content-Type": "application/json", ...cors } });
             }
 
+            // Service Worker Route
+            if (path === "/sw.js") {
+                return new Response(SW_SOURCE, { headers: { "Content-Type": "application/javascript; charset=UTF-8", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache" } });
+            }
+
             // Main UI Route
             if (path === "/" || path === "/index.html") {
                 const coords = { lat: request.cf?.latitude || null, lon: request.cf?.longitude || null };
-                return new Response(HTML_TEMPLATE({ coords }), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" } });
+                return new Response(HTML_TEMPLATE({ coords }), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-cache" } });
             }
             
             // --- R2 Storage Handlers ---
@@ -854,14 +970,14 @@ export default {
                     const response = await fetch(targetUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NexusBot/11.0)' }, redirect: 'follow', signal: controller.signal });
                     clearTimeout(timeoutId);
 
-                    const state = { title: null, description: null, image: null, inTitle: false };
-                    await new HTMLRewriter().on("title", new MetaHandler(state)).on("meta", new MetaHandler(state)).transform(response).text();
+                    const state = { title: null, description: null, image: null, icon: null, inTitle: false };
+                    await new HTMLRewriter().on("title", new MetaHandler(state)).on("meta", new MetaHandler(state)).on("link", new MetaHandler(state)).transform(response).text();
 
-                    // og:image 可能是相对路径，解析为绝对地址后再回传
-                    let icon = state.image ? state.image.trim() : "";
+                    // 优先用 <link rel="icon"> 作为图标（比 og:image 更适合小尺寸），相对路径解析为绝对地址
+                    let icon = (state.icon || state.image || "").trim();
                     if (icon && !/^https?:/i.test(icon)) { try { icon = new URL(icon, targetUrl).href; } catch { icon = ""; } }
                     return new Response(JSON.stringify({ title: state.title ? state.title.trim() : "", description: state.description ? state.description.trim() : "", icon }), { headers: cors });
-                } catch (e) { return new Response(JSON.stringify({ error: e.message }), { headers: cors }); }
+                } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 502, headers: cors }); }
             }
             
             if (path === "/api/data") {
@@ -886,9 +1002,12 @@ export default {
                 }
                 if (request.method === "POST") {
                     if (!(await checkAuth(request, env))) return new Response("Unauthorized", { status: 401, headers: cors });
-                    const body = await request.json();
-                    if (body.groups) await env.NAV_R2.put("nav_data", JSON.stringify(body.groups));
-                    if (body.settings) await env.NAV_R2.put("nav_settings", JSON.stringify(body.settings));
+                    const raw = await request.text();
+                    if (raw.length > 4 * 1024 * 1024) return new Response("Payload Too Large", { status: 413, headers: cors });
+                    let body;
+                    try { body = JSON.parse(raw); } catch { return new Response("Bad Request", { status: 400, headers: cors }); }
+                    if (body && Array.isArray(body.groups)) await env.NAV_R2.put("nav_data", JSON.stringify(body.groups));
+                    if (body && body.settings) await env.NAV_R2.put("nav_settings", JSON.stringify(body.settings));
                     return new Response("Saved", { headers: cors });
                 }
             }
@@ -907,12 +1026,17 @@ export default {
             }
 
             if (path === "/api/login" && request.method === "POST") {
+                const ip = request.headers.get("CF-Connecting-IP") || "";
+                const gate = await checkLoginThrottle(env, ip);
+                if (gate.blocked) return new Response(JSON.stringify({ error: "too_many_attempts", retryAfter: gate.retryAfter }), { status: 429, headers: cors });
                 const body = await request.json();
                 const stored = await verifyCreds(env, body?.username, body?.password);
                 if (stored) {
+                    await clearLoginFails(env, ip);
                     const token = await createSession(env, stored.username);
                     return new Response(JSON.stringify({ token }), { headers: cors });
                 }
+                await recordLoginFail(env, ip);
                 return new Response("Unauthorized", { status: 401, headers: cors });
             }
 
