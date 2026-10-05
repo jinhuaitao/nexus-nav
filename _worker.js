@@ -451,7 +451,7 @@ const HTML_TEMPLATE = (context) => `
                         <button @click="settings.bgType = 'bing'" class="flex-1 py-2 rounded-lg text-xs font-medium transition border" :class="settings.bgType === 'bing' ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-gray-500/20 hover:bg-gray-500/10'" style="color: var(--text-secondary)">Bing Image</button>
                         <button @click="settings.bgType = 'custom'" class="flex-1 py-2 rounded-lg text-xs font-medium transition border" :class="settings.bgType === 'custom' ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-gray-500/20 hover:bg-gray-500/10'" style="color: var(--text-secondary)">Custom URL</button>
                     </div>
-                    <input x-show="settings.bgType === 'custom'" type="text" x-model="settings.customBg" placeholder="Image or Video (.mp4) URL" class="search-input w-full p-2.5 rounded-lg text-xs">
+                    <input x-show="settings.bgType === 'custom'" type="text" x-model="settings.customBg" autocomplete="off" spellcheck="false" placeholder="Image or Video (.mp4) URL" class="search-input w-full p-2.5 rounded-lg text-xs">
                 </div>
                 <div class="p-4 rounded-xl bg-gray-500/5 border border-gray-500/10">
                     <label class="text-xs font-bold uppercase tracking-wider mb-3 block opacity-50" style="color: var(--text-secondary)">视觉 & 布局</label>
@@ -474,7 +474,7 @@ const HTML_TEMPLATE = (context) => `
                 </div>
                 <div class="p-4 rounded-xl bg-gray-500/5 border border-gray-500/10">
                     <label class="text-xs font-bold uppercase tracking-wider mb-3 block opacity-50" style="color: var(--text-secondary)">自定义搜索引擎</label>
-                    <input type="text" x-model="settings.customSearchUrl" placeholder="https://www.example.com/search?q=" class="search-input w-full p-2.5 rounded-lg text-xs mb-2">
+                    <input type="text" x-model="settings.customSearchUrl" autocomplete="off" spellcheck="false" placeholder="https://www.example.com/search?q=" class="search-input w-full p-2.5 rounded-lg text-xs mb-2">
                     <p class="text-[10px] leading-relaxed" style="color: var(--text-secondary)">填写搜索地址前缀，关键词会自动拼接在末尾。在顶部搜索栏选择「自定义」引擎后生效。</p>
                 </div>
                 <div class="p-4 rounded-xl bg-gray-500/5 border border-gray-500/10">
@@ -485,11 +485,14 @@ const HTML_TEMPLATE = (context) => `
                     <div class="space-y-3">
                         <div>
                             <div class="flex justify-between text-xs mb-1.5" style="color: var(--text-secondary)"><span>Site Key</span><span x-show="ts.siteKeySet" class="font-mono" x-text="ts.siteKeyMasked"></span></div>
-                            <input type="text" x-model="ts.form.siteKey" :placeholder="ts.siteKeySet ? '已配置（留空则不修改）' : '0x4AAA...'" class="search-input w-full p-2.5 rounded-lg text-xs font-mono">
+                            <input type="text" x-model="ts.form.siteKey" autocomplete="off" spellcheck="false" data-form-type="other" data-lpignore="true" data-1p-ignore :placeholder="ts.siteKeySet ? '已配置（留空则不修改）' : '0x4AAA...'" class="search-input w-full p-2.5 rounded-lg text-xs font-mono">
                         </div>
                         <div>
                             <div class="flex justify-between text-xs mb-1.5" style="color: var(--text-secondary)"><span>Secret Key</span><span x-show="ts.secretKeySet" class="font-mono" x-text="ts.secretKeyMasked"></span></div>
-                            <input type="password" x-model="ts.form.secretKey" :placeholder="ts.secretKeySet ? '已配置（留空则不修改）' : '0x4AAA...'" class="search-input w-full p-2.5 rounded-lg text-xs font-mono">
+                            <!-- autocomplete="new-password" 明确告诉浏览器「这是一个新密钥，不是登录口令」：
+                                 既不会被保存的账号自动填充，也不会触发「是否保存密码」的提示条。
+                                 配合三个密码管理器的忽略标记，避免它们往这里塞自动填充图标。 -->
+                            <input type="password" x-model="ts.form.secretKey" autocomplete="new-password" spellcheck="false" data-form-type="other" data-lpignore="true" data-1p-ignore :placeholder="ts.secretKeySet ? '已配置（留空则不修改）' : '0x4AAA...'" class="search-input w-full p-2.5 rounded-lg text-xs font-mono">
                         </div>
                         <div class="flex items-center justify-between">
                             <span class="text-xs" style="color: var(--text-secondary)">容错模式</span>
