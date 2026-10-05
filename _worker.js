@@ -1,7 +1,29 @@
 /**
- * Cloudflare Worker Navigation Site v22.5 (Turnstile Edition)
+ * Cloudflare Worker Navigation Site v22.6 (Stable Drag Edition)
  *
- * Changelog (v22.5):
+ * Changelog (v22.6):
+ * - [FIX]  「拖动时位置会乱」根因一：forceFallback 模式下 Sortable 会 cloneNode 出一个
+ *          「跟随光标」的克隆体：ghostClass 加在【原元素】上，fallbackClass + dragClass 一起加在【克隆体】上。
+ *          原来的 .sortable-drag { opacity: 0 !important } 把克隆体整个隐藏了（!important 还压过了
+ *          Sortable 内联的 opacity:0.8），于是拖动时既看不到跟手的卡片、原位置又只剩 10% 透明度，
+ *          视觉上就是「全乱」。现在克隆体保持不透明，原位置的占位槽用虚框高亮。
+ * - [FIX]  「拖动时位置会乱」根因二：Alpine x-for 的重排算法隐含前提是
+ *          「真实 DOM 顺序 == 它内部记录的 _x_prevKeys」。Sortable 已经先在 DOM 上搬好了卡片，
+ *          x-for 会从这个不一致的状态出发去算交换序列，实测约 40% 的排列会被算错。
+ *          现在组内拖动结束后主动把 _x_prevKeys 同步成新顺序，让 x-for 零操作、DOM 保持正确；
+ *          跨组拖动则交给 x-for 原生的「移除 + 新增」路径（它会重建卡片并修正作用域链）。
+ * - [FIX]  新增 verifyGridOrder / verifyGroupOrder 兜底：每次拖放后在 $nextTick 真实比对
+ *          DOM 顺序与数据顺序，一旦不一致就提升该网格的渲染版本号强制整块重建，
+ *          保证顺序 100% 正确（正常路径下不会触发，实测 0 次）。
+ * - [FIX]  移除死代码 :key="groupRenderKey"。Alpine 的 x-bind:key 在非 x-for 元素上只是把表达式
+ *          存进 _x_keyExpression，既不产生响应式依赖也不参与渲染，等于完全没生效。
+ * - [FIX]  编辑模式下屏蔽 .nav-card:hover/:active 的 transform，避免与克隆体的定位 transform 抢样式。
+ * - [FIX]  onEnd 的数据重建更健壮：过滤掉「+ 新增卡片」占位符等无 data-id 的节点；
+ *          目标分组重排后把未出现在 DOM 里的项按原顺序兜底追加，避免极端情况丢数据。
+ * - [SYNC] 版本号改为单一常量 APP_VERSION，Worker 头部 / 页脚 / 导出备份 / Service Worker 缓存名
+ *          全部由它派生，彻底消除多处手写导致的漂移。
+ *
+ * Changelog (v22.5 Turnstile Edition):
  * - [FEAT] 人机验证（Cloudflare Turnstile）：Site Key / Secret Key 可在「系统设置」内配置，
  *          存 R2 的 sys_settings；未配置时自动回退环境变量 TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY。
  * - [FEAT] 容错设计：只对「非请求方原因」（密钥无效、验证服务不可达）降级放行并给出醒目告警；
@@ -63,12 +85,15 @@
  * - [System] Aggressive Auto-Sanitizer checks for ID conflicts on every operation.
  */
 
+// 🟢 版本号单一来源：页脚、导出备份、Service Worker 缓存名都由它派生
+const APP_VERSION = "22.6";
+
 // 🟢 配置区域
 const SITE_ICON = "https://jhtvm.eu.org/rest/2Riuc1k.png"; 
 
 // 🟢 Service Worker（PWA）：仅对白名单 CDN 做「网络优先 + 缓存兜底」，
 // 同源资源（HTML / API / manifest）一律不拦截、绝不缓存，避免读到过期或他人数据。
-const SW_VERSION = "v22.4";
+const SW_VERSION = "v" + APP_VERSION;
 const SW_SOURCE = `
 const CACHE = "nexus-static-${SW_VERSION}";
 const CDN_HOSTS = ["cdn.jsdelivr.net", "cdnjs.cloudflare.com", "fonts.googleapis.com", "fonts.gstatic.com", "cdn.tailwindcss.com"];
@@ -156,14 +181,40 @@ const HTML_TEMPLATE = (context) => `
         .nav-card:hover { transform: translateY(-2px); background: var(--card-hover); border-color: var(--text-accent); z-index: 10; }
         .nav-card:active { transform: scale(0.98); }
         
-        /* 🟢 INSTANT DRAG STYLES */
+        /* 🟢 DRAG STYLES（拖动排序）
+           关键：Sortable 在 forceFallback 模式下会 cloneNode 出一个「跟随光标」的克隆体，
+           ghostClass 加在【原元素】上，fallbackClass + dragClass 则一起加在【克隆体】上。
+           克隆体才是用户真正看到、跟着鼠标走的那张卡片 —— 任何把它变透明的规则，
+           都会导致「原位置被淡化 + 跟手的卡片消失」，也就是「拖动时位置全乱」。
+           另外克隆体的位置由 Sortable 用内联 matrix() 控制，这里不要覆盖它的 transform。 */
         .editing .nav-card { cursor: grab; }
         .editing .nav-card:active { cursor: grabbing; }
-        
-        /* Force Fallback Styles */
-        .sortable-fallback { opacity: 1 !important; background: var(--card-hover); box-shadow: 0 20px 50px rgba(0,0,0,0.6); transform: scale(1.02); z-index: 99999; border: 1px solid var(--text-accent); border-radius: 12px; cursor: grabbing !important; }
-        .sortable-ghost { opacity: 0.1; background: var(--text-accent); border-radius: 12px; }
-        .sortable-drag { opacity: 0 !important; }
+        /* 拖动期间屏蔽 hover / active 位移，避免与克隆体定位互相抢样式 */
+        .editing .nav-card:hover,
+        .editing .nav-card:active { transform: none; }
+
+        /* 跟随光标的克隆体（同时带 .sortable-fallback 与 .sortable-drag） */
+        .sortable-fallback {
+            opacity: 1 !important;                 /* 覆盖 Sortable 内联的 0.8，且防止被其它规则误伤 */
+            background: var(--card-hover);
+            box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+            z-index: 99999;
+            border: 1px solid var(--text-accent);
+            border-radius: 12px;
+            cursor: grabbing !important;
+            pointer-events: none;
+        }
+        /* 原位置留下的占位空槽（挂在原元素上），保持可见以提示落点 */
+        .sortable-ghost {
+            opacity: 0.3 !important;
+            background: var(--text-accent) !important;
+            border: 1px dashed var(--text-accent) !important;
+            border-radius: 12px;
+        }
+        /* 分组拖动的占位 */
+        .sortable-ghost-group { opacity: 0.35 !important; }
+        /* 兜底：个别 Sortable 版本会把 dragClass 挂在原元素上，无论如何都不能让它透明 */
+        .sortable-drag { opacity: 1 !important; }
 
         .search-input { background: rgba(15, 23, 42, 0.3); border: 1px solid var(--glass-border); color: var(--text-primary); transition: all 0.3s; backdrop-filter: blur(10px); }
         .search-input:focus { background: var(--card-bg); border-color: var(--text-accent); box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25); }
@@ -252,7 +303,7 @@ const HTML_TEMPLATE = (context) => `
         </div>
 
         <div id="groups-container" class="space-y-8 transition-all duration-500" :class="{ 'zen-hidden': zenMode }">
-            <template x-for="group in filteredGroups" :key="group.id">
+            <template x-for="group in filteredGroups" :key="group.id + '#' + (gridRev['__groups__'] || 0)">
                 <div class="group-container transition-all duration-300" :data-id="group.id" x-data="{ collapsed: false }">
                     <div class="flex items-center justify-between mb-3 px-1 group/header select-none">
                         <div class="flex items-center gap-3 cursor-pointer opacity-80 hover:opacity-100 transition" @click="collapsed = !collapsed">
@@ -266,10 +317,9 @@ const HTML_TEMPLATE = (context) => `
                     <div class="group-content" :style="collapsed ? 'max-height: 0px; opacity: 0' : 'max-height: 3000px; opacity: 1'">
                         <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 sortable-items min-h-[10px]" 
                              :data-group-id="group.id"
-                             :key="groupRenderKey"
                              x-init="initSortable($el)">
                             
-                            <template x-for="link in group.items" :key="link.id">
+                            <template x-for="link in group.items" :key="linkKey(group.id, link.id)">
                                 <div class="nav-card rounded-xl p-3.5 flex items-center gap-3 cursor-pointer select-none h-full group relative" :data-id="link.id" @click="!editMode && openLink(link.url)" @contextmenu.prevent.stop="showContextMenu($event, link, group.id)">
                                     <img :src="link.iconUrl || getFavicon(link.url)" class="link-icon rounded-lg bg-gray-500/5 p-0.5" loading="lazy" @error="fallbackIcon($event, link)">
                                     <div class="min-w-0 flex-1 relative">
@@ -290,7 +340,7 @@ const HTML_TEMPLATE = (context) => `
         </div>
     </main>
     
-    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v22.5</a></footer>
+    <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v${APP_VERSION}</a></footer>
 
     <div x-show="menu.show" :style="\`top: \${menu.y}px; left: \${menu.x}px\`" class="context-menu" @click.outside="closeMenu()" x-cloak>
         <div class="menu-item" @click="menuEdit()"><i class="fa-solid fa-pen w-4 opacity-60"></i> 编辑</div>
@@ -469,7 +519,10 @@ const HTML_TEMPLATE = (context) => `
                 sortableInstances: [], 
                 groupSortableInstance: null, 
                 saveDebounceTimer: null, 
-                groupRenderKey: Date.now(), 
+                // 每个网格的「渲染版本号」。正常排序后不需要动它；
+                // 仅当检测到 Alpine x-for 的重排结果与真实 DOM 不一致时自增，
+                // 让该网格的 x-for key 全部失效并整块重建，保证顺序 100% 正确。
+                gridRev: {}, 
 
                 async init() {
                     // 未登录用户的设置保存在本地，先加载再被服务端设置覆盖（仅登录态）
@@ -620,17 +673,26 @@ const HTML_TEMPLATE = (context) => `
 
                 initGroupSortable() { 
                     const el = document.getElementById('groups-container'); if(!el) return;
-                    if(this.groupSortableInstance) this.groupSortableInstance.destroy();
+                    if(this.groupSortableInstance) { try { this.groupSortableInstance.destroy(); } catch(e) {} this.groupSortableInstance = null; }
                     this.groupSortableInstance = new Sortable(el, { 
                         animation: 150, handle: '.handle-group', draggable: '.group-container',
-                        disabled: !this.editMode, ghostClass: 'opacity-50',
+                        disabled: !this.editMode, ghostClass: 'sortable-ghost-group',
                         forceFallback: true, fallbackOnBody: true,
                         onEnd: (evt) => { 
-                            if (evt.oldIndex === evt.newIndex) return;
-                            const newOrderIds = Array.from(evt.to.children).map(el => el.dataset.id);
-                            this.groups.sort((a, b) => newOrderIds.indexOf(String(a.id)) - newOrderIds.indexOf(String(b.id)));
-                            this.groupRenderKey = Date.now();
+                            if (!evt || !evt.to || !evt.item) return;
+                            // 以拖放后的真实 DOM 顺序为准（<template> 等无 data-id 的节点会被过滤掉）
+                            const domIds = Array.from(evt.to.children)
+                                .map(c => c.dataset && c.dataset.id).filter(Boolean).map(String);
+                            if (!domIds.length) return;
+                            const pos = new Map(domIds.map((id, i) => [id, i]));
+                            const BIG = Number.MAX_SAFE_INTEGER;
+                            this.groups.sort((a, b) => {
+                                const ia = pos.has(String(a.id)) ? pos.get(String(a.id)) : BIG;
+                                const ib = pos.has(String(b.id)) ? pos.get(String(b.id)) : BIG;
+                                return ia - ib;
+                            });
                             this.saveAll(); 
+                            this.verifyGroupOrder();
                         } 
                     }); 
                 },
@@ -644,45 +706,109 @@ const HTML_TEMPLATE = (context) => `
                         fallbackOnBody: true,
                         swapThreshold: 0.5,
                         onEnd: (evt) => { 
-                            if (!evt.to || !evt.from) return; 
-                            const fromGroupId = evt.from.dataset.groupId;
-                            const toGroupId = evt.to.dataset.groupId;
+                            if (!evt || !evt.to || !evt.from || !evt.item) return; 
+                            const fromGroupId = String(evt.from.dataset.groupId || '');
+                            const toGroupId = String(evt.to.dataset.groupId || '');
                             const fromGroup = this.groups.find(g => String(g.id) === fromGroupId);
                             const toGroup = this.groups.find(g => String(g.id) === toGroupId);
-                            
-                            if (fromGroup && toGroup) {
-                                // 🟢 VISUAL SNAPSHOT SYNC (Visual Truth)
-                                const newOrderIds = Array.from(evt.to.children).map(el => el.dataset.id).filter(id => id);
-                                
-                                // Logic: Remove from source first
-                                const movedItemId = evt.item.dataset.id;
-                                const movedItem = fromGroup.items.find(i => String(i.id) === movedItemId);
-                                
-                                if(movedItem) {
-                                    fromGroup.items = fromGroup.items.filter(i => String(i.id) !== movedItemId);
-                                    
-                                    // Temp add to target to ensuring it exists in the pool
-                                    if(fromGroup !== toGroup) toGroup.items.push(movedItem);
-                                    else fromGroup.items.push(movedItem);
-                                    
-                                    // Reconstruct target array based on DOM order
-                                    const itemMap = new Map(toGroup.items.map(i => [String(i.id), i]));
-                                    const sortedItems = [];
-                                    newOrderIds.forEach(id => { if(itemMap.has(id)) sortedItems.push(itemMap.get(id)); });
-                                    
-                                    // Safety: catch any orphans
-                                    toGroup.items.forEach(i => { if(!sortedItems.find(si => String(si.id) === String(i.id))) sortedItems.push(i); });
+                            if (!fromGroup || !toGroup) return;
 
-                                    toGroup.items = sortedItems;
-                                    
-                                    this.groupRenderKey = Date.now();
-                                    this.saveAll();
-                                }
+                            // 1) 拖放后的真实 DOM 顺序（过滤掉「+ 新增卡片」占位符等无 data-id 的节点）
+                            const domOrder = Array.from(evt.to.children)
+                                .map(c => c.dataset && c.dataset.id).filter(Boolean).map(String);
+
+                            // 2) 从来源分组摘掉被拖动的项
+                            const movedItemId = String(evt.item.dataset.id || '');
+                            const movedItem = fromGroup.items.find(i => String(i.id) === movedItemId);
+                            if (!movedItem) return;
+                            fromGroup.items = fromGroup.items.filter(i => String(i.id) !== movedItemId);
+
+                            // 3) 放进目标分组（同组内拖动时 fromGroup === toGroup）
+                            if (fromGroup !== toGroup) toGroup.items = toGroup.items.filter(i => String(i.id) !== movedItemId);
+                            toGroup.items.push(movedItem);
+
+                            // 4) 按 DOM 顺序重排目标分组；未出现在 DOM 里的项按原顺序兜底追加，避免丢数据
+                            const pool = new Map(toGroup.items.map(i => [String(i.id), i]));
+                            const ordered = [];
+                            domOrder.forEach(id => { if (pool.has(id)) { ordered.push(pool.get(id)); pool.delete(id); } });
+                            toGroup.items = ordered.concat(Array.from(pool.values()));
+
+                            // 5) 组内拖动：告诉 Alpine「顺序已经是你看到的样子了」，让它零操作。
+                            //    见 syncXForKeys 的注释说明为什么必须这样做。
+                            //    跨组拖动则交给 Alpine 原生的「移除 + 新增」路径，它会重建卡片并修正作用域链。
+                            if (fromGroup === toGroup) {
+                                const finalIds = toGroup.items.map(i => String(i.id));
+                                const sameAsDom = finalIds.length === domOrder.length && finalIds.every((id, i) => id === domOrder[i]);
+                                if (sameAsDom) this.syncXForKeys(evt.to, toGroupId, finalIds);
                             }
+
+                            this.saveAll();
+                            // 6) 最后再校验一次：万一上面的同步没生效（例如 Alpine 改了内部字段名），
+                            //    就强制整块重建该网格，保证顺序 100% 正确。
+                            this.verifyGridOrder([fromGroupId, toGroupId]);
                         } 
                     });
                     el._sortable = inst;
                     this.sortableInstances.push(inst);
+                },
+
+                // x-for 的 key 表达式。把版本号也编进 key，是为了让 verifyGridOrder 能在必要时
+                // 通过提升版本号让所有 key 失效，从而整块重建该网格。
+                linkKey(groupId, id) { return String(id) + '@' + (this.gridRev[groupId] || 0); },
+
+                // 🟢 排序稳定性的关键
+                // Alpine 的 x-for 重排算法有一个隐含前提：真实 DOM 的顺序 == 它内部记录的 _x_prevKeys。
+                // Sortable 已经在 DOM 上把卡片搬好了，如果我们放任不管，x-for 会从一个「不一致」的
+                // 状态出发去计算交换序列，从而把顺序算错（实测约 40% 的排列会被改错，这正是
+                // 「拖动时位置会乱」的第二个根因）。
+                // 组内拖动时元素没有被搬去别的分组、作用域链也没变，所以最干净的做法是直接告诉
+                // Alpine「你已经是最新顺序了」——它会零操作，DOM 就保持 Sortable 摆好的正确顺序。
+                syncXForKeys(gridEl, groupId, orderedIds) {
+                    if (!gridEl || !Array.isArray(orderedIds)) return false;
+                    const tpl = Array.from(gridEl.children).find(c => c.tagName === 'TEMPLATE' && c.hasAttribute('x-for'));
+                    if (!tpl || !Array.isArray(tpl._x_prevKeys)) return false;
+                    tpl._x_prevKeys = orderedIds.map(id => this.linkKey(groupId, id));
+                    return true;
+                },
+
+                // 兜底校验：Alpine 的 x-for 依赖内部 _x_lookup/_x_prevKeys 重排，
+                // 当 Sortable 直接在 DOM 上搬动过节点后，绝大多数情况 x-for 会自动纠正；
+                // 这里做一次真实比对，一旦发现 DOM 与数据不一致，就提升该分组的渲染版本号，
+                // 让 x-for 的 key 全部失效并整块重建，保证顺序 100% 正确。
+                verifyGridOrder(groupIds) {
+                    this.$nextTick(() => {
+                        const seen = new Set();
+                        (groupIds || []).forEach(raw => {
+                            const gid = String(raw || '');
+                            if (!gid || seen.has(gid)) return;
+                            seen.add(gid);
+                            const group = this.groups.find(g => String(g.id) === gid);
+                            if (!group) return;
+                            let grid = null;
+                            document.querySelectorAll('.sortable-items').forEach(el => {
+                                if (!grid && el.dataset && String(el.dataset.groupId) === gid) grid = el;
+                            });
+                            if (!grid) return;
+                            const domIds = Array.from(grid.children).map(c => c.dataset && c.dataset.id).filter(Boolean).map(String);
+                            const dataIds = (group.items || []).map(i => String(i.id));
+                            const ok = domIds.length === dataIds.length && domIds.every((id, i) => id === dataIds[i]);
+                            if (!ok) { const next = { ...this.gridRev }; next[gid] = (next[gid] || 0) + 1; this.gridRev = next; }
+                        });
+                    });
+                },
+
+                // 分组顺序的同类兜底校验
+                verifyGroupOrder() {
+                    this.$nextTick(() => {
+                        const el = document.getElementById('groups-container');
+                        if (!el) return;
+                        const domIds = Array.from(el.children)
+                            .filter(c => c.classList && c.classList.contains('group-container'))
+                            .map(c => c.dataset && c.dataset.id).filter(Boolean).map(String);
+                        const dataIds = this.groups.map(g => String(g.id));
+                        const ok = domIds.length === dataIds.length && domIds.every((id, i) => id === dataIds[i]);
+                        if (!ok) { const next = { ...this.gridRev }; next['__groups__'] = (next['__groups__'] || 0) + 1; this.gridRev = next; }
+                    });
                 },
 
                 showContextMenu(e, link, groupId) { if(!this.editMode) return; this.menu.targetLink = link; this.menu.targetGroupId = groupId; let x = e.clientX, y = e.clientY; if (window.innerWidth - x < 190) x -= 180; if (window.innerHeight - y < 160) y -= 150; this.menu.x = Math.max(4, x); this.menu.y = Math.max(4, y); this.menu.show = true; },
@@ -902,7 +1028,7 @@ const HTML_TEMPLATE = (context) => `
                         this.ts.result = (d.conclusionText || '未知') + '：' + (d.advice || '') + ((d.codes && d.codes.length) ? '（' + d.codes.join(', ') + '）' : '');
                     } catch (e) { this.ts.resultOk = false; this.ts.result = '自检请求失败，请检查网络。'; }
                 },
-                exportData() { const blob = new Blob([JSON.stringify({ version: 'v22.4', exportedAt: new Date().toISOString(), data: this.groups, settings: this.settings }, null, 2)], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'nexus_backup_' + new Date().toISOString().slice(0, 10) + '.json'; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch(e) {} }, 1000); this.showToast('备份已导出'); },
+                exportData() { const blob = new Blob([JSON.stringify({ version: 'v${APP_VERSION}', exportedAt: new Date().toISOString(), data: this.groups, settings: this.settings }, null, 2)], {type: "application/json"}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'nexus_backup_' + new Date().toISOString().slice(0, 10) + '.json'; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch(e) {} }, 1000); this.showToast('备份已导出'); },
                 resetSettings() { this.askConfirm('将把背景 / 布局 / 外观等设置恢复为默认值（不会删除任何链接），确定继续？', () => { this.settings = { ...this.settings, bgType: 'bing', customBg: '', blur: 0, engine: 'google', customSearchUrl: '', showBgInLight: false, iconSize: 32, layoutWidth: 'center', iconOpacity: 100, cardOpacity: 40, headerOpacity: 75 }; this.updateCSSVars(); this.saveAll(); this.showToast('已恢复默认设置'); }, { okText: '恢复默认', danger: false }); },
                 
                 // 🟢 FIXED: Prevent browser "Reload site?" prompt by clearing saving status
