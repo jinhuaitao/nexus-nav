@@ -1,5 +1,11 @@
 /**
- * Cloudflare Worker Navigation Site v22.9 (Login UI Edition)
+ * Cloudflare Worker Navigation Site v22.9.1 (Settings Sync Edition)
+ *
+ * Changelog (v22.9.1 Settings Sync Edition):
+ * - [FIX] 退出登录后视觉设置失效：登录态保存设置只写 R2、不写本地，且 GET /api/data 在无 token 时
+ *         直接丢弃服务端下发的 settings，刷新后回到默认背景/布局/外观。
+ *         现在服务端设置对未登录访客同样生效（以服务端为准），登录态保存时也顺手写一份本地快照
+ *         用于首帧渲染；memo 始终不写入 localStorage。
  *
  * Changelog (v22.9 Login UI Edition):
  * - [UI]  登录弹窗重做，与全站设计语言对齐：徽标沿用顶部栏那枚 fa-atom + indigo→purple 渐变
@@ -141,7 +147,7 @@
  */
 
 // 🟢 版本号单一来源：页脚、导出备份、Service Worker 缓存名都由它派生
-const APP_VERSION = "22.9";
+const APP_VERSION = "22.9.1";
 
 // 🟢 配置区域
 const SITE_ICON = "https://jhtvm.eu.org/rest/2Riuc1k.png"; 
@@ -1061,9 +1067,18 @@ const HTML_TEMPLATE = (context) => `
                 },
                 deleteGroup() { this.askConfirm('该分组及其中的全部链接都会被删除，且不可恢复。', () => { this.groups = this.groups.filter(x => String(x.id) !== String(this.groupForm.id)); this.saveAll(); this.modals.group = false; this.showToast('分组已删除'); }, { okText: '删除分组' }); },
 
-                async syncData(method, payload = null) { const headers = { 'Content-Type': 'application/json' }; if(this.token) headers['Authorization'] = this.token; if(method === 'POST') this.status.saving = true; try { const res = await fetch('/api/data', { method, headers, body: payload ? JSON.stringify(payload) : null }); if(res.status === 401) { this.logout('登录已过期，请重新登录'); return; } if(method === 'GET') { const data = await res.json(); const raw = Array.isArray(data.data) ? data.data : []; this.groups = (raw.length > 0 && raw[0] && !raw[0].items) ? [{ id: 'default', name: 'Home', isPrivate: false, items: raw }] : raw; if(data.settings && this.token) { this.settings = { ...this.settings, ...data.settings }; this.updateCSSVars(); } this.sanitizeData(this.groups); } else { this.status.pending = false; } } catch(e) { if(method === 'POST') this.status.pending = true; } finally { this.status.saving = false; } },
+                async syncData(method, payload = null) { const headers = { 'Content-Type': 'application/json' }; if(this.token) headers['Authorization'] = this.token; if(method === 'POST') this.status.saving = true; try { const res = await fetch('/api/data', { method, headers, body: payload ? JSON.stringify(payload) : null }); if(res.status === 401) { this.logout('登录已过期，请重新登录'); return; } if(method === 'GET') { const data = await res.json(); const raw = Array.isArray(data.data) ? data.data : []; this.groups = (raw.length > 0 && raw[0] && !raw[0].items) ? [{ id: 'default', name: 'Home', isPrivate: false, items: raw }] : raw; 
+                    // 视觉设置以服务端为准：未登录时也应用（管理员设置的背景/布局/外观对访客同样生效）。
+                    // 服务端在匿名请求里已剔除 memo，这里再兜底清一次，避免把上一个登录态残留的便签写进本地缓存。
+                    if(data.settings) { this.settings = { ...this.settings, ...data.settings }; if(!this.token) this.settings.memo = ''; this.updateCSSVars(); this.cacheSettings(); } 
+                    this.sanitizeData(this.groups); } else { this.status.pending = false; } } catch(e) { if(method === 'POST') this.status.pending = true; } finally { this.status.saving = false; } },
+
+                // 本地快照：登录态也写一份，这样退出登录后刷新页面仍能按上次的视觉设置先渲染，
+                // 随后 GET /api/data 再用服务端设置覆盖。memo 属私密内容，一律不落地。
+                cacheSettings() { try { const s = { ...this.settings }; delete s.memo; localStorage.setItem('nexus_settings', JSON.stringify(s)); } catch(e) {} },
                 
                 saveAll() { 
+                    this.cacheSettings();
                     if(this.isLoggedIn) { 
                         if (this.saveDebounceTimer) clearTimeout(this.saveDebounceTimer);
                         this.status.pending = true; 
@@ -1072,10 +1087,8 @@ const HTML_TEMPLATE = (context) => `
                             this.status.pending = false;
                             this.saveDebounceTimer = null;
                         }, 500); 
-                    } else {
-                        // 未登录：设置（主题/背景/布局/引擎等）本地生效，不再报「请先登录」
-                        try { localStorage.setItem('nexus_settings', JSON.stringify(this.settings)); } catch(e) {}
                     }
+                    // 未登录：设置（主题/背景/布局/引擎等）本地生效，不再报「请先登录」
                 }, 
                 async saveSettings() { await this.saveAll(); },
                 async checkStatus() { try { const res = await fetch('/api/status'); this.needsSetup = !(await res.json()).setup; if(this.needsSetup) { this.modals.login = true; await this.refreshTsCfg(); this.ensureTsScript(); this.$nextTick(() => this.renderTurnstile()); } } catch(e) {} },
