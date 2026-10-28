@@ -193,7 +193,11 @@ const HTML_TEMPLATE = (context) => `
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.3/dist/cdn.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
-    
+
+    <!-- 🟢 Google AdSense：发布商 ID 由环境变量 AD_CLIENT_ID 注入（wrangler secret put AD_CLIENT_ID）。
+         未配置时不渲染此脚本，页面零广告；若用「自动广告 Auto Ads」，有这一句就够，无需下面的 <ins>。 -->
+    ${(context.ads && context.ads.clientId) ? `<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${context.ads.clientId}" crossorigin="anonymous"></script>` : ''}
+
     <style>
         [x-cloak] { display: none !important; }
         * { -webkit-tap-highlight-color: transparent; }
@@ -401,6 +405,20 @@ const HTML_TEMPLATE = (context) => `
             </div>
         </div>
 
+        ${(context.ads && context.ads.clientId) ? `
+        <!-- 🟢 Google AdSense：顶部广告位（响应式自适应，搜索框下方）。
+             广告单元 ID 由环境变量 AD_TOP_SLOT 控制；若用「自动广告」，可整段删掉。 -->
+        <div x-show="!zenMode" class="max-w-7xl mx-auto px-4 sm:px-6 mb-8" x-cloak>
+            <ins class="adsbygoogle"
+                 style="display:block"
+                 data-ad-client="${context.ads.clientId}"
+                 data-ad-slot="${context.ads.topSlot}"
+                 data-ad-format="auto"
+                 data-full-width-responsive="true"></ins>
+            <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+        </div>
+        ` : ''}
+
         <div id="groups-container" class="space-y-8 transition-all duration-500" :class="{ 'zen-hidden': zenMode }">
             <template x-for="group in filteredGroups" :key="group.id + '#' + (gridRev['__groups__'] || 0)">
                 <div class="group-container transition-all duration-300" :data-id="group.id" x-data="{ collapsed: false }">
@@ -438,7 +456,22 @@ const HTML_TEMPLATE = (context) => `
             <div x-cloak><i class="fa-brands fa-space-awesome text-6xl mb-6 animate-pulse"></i><p class="text-sm tracking-wide" x-text="searchHint"></p><button x-show="isLoggedIn && !search" @click="openGroupModal()" class="mt-6 px-6 py-2 rounded-full bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600 hover:text-white transition text-sm font-bold">开始构建</button><button x-show="search" @click="search=''; updateSortableState(); $refs.searchInput.focus()" class="mt-6 px-6 py-2 rounded-full bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600 hover:text-white transition text-sm font-bold">清空搜索</button></div>
         </div>
     </main>
-    
+
+    ${(context.ads && context.ads.clientId) ? `
+    <!-- 🟢 Google AdSense：底部广告位（导航内容下方、页脚上方）。
+         广告单元 ID 由环境变量 AD_BOTTOM_SLOT 控制；若想做成「固定悬浮底栏」，
+         把外层 class 改为 "fixed bottom-0 left-0 w-full z-40 ..."，并把 <main> 的 pb-24 调大以免遮挡。 -->
+    <div x-show="!zenMode" class="max-w-7xl mx-auto px-4 sm:px-6 mb-6" x-cloak>
+        <ins class="adsbygoogle"
+             style="display:block"
+             data-ad-client="${context.ads.clientId}"
+             data-ad-slot="${context.ads.bottomSlot}"
+             data-ad-format="auto"
+             data-full-width-responsive="true"></ins>
+        <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+    </div>
+    ` : ''}
+
     <footer class="text-center pb-8 relative z-0 transition-opacity duration-500" :class="{ 'opacity-0 pointer-events-none': zenMode }"><a href="https://github.com/jinhuaitao/NAV" target="_blank" class="text-xs font-mono opacity-30 hover:opacity-100 transition-opacity" style="color: var(--text-secondary)">Nexus v${APP_VERSION}</a></footer>
 
     <div x-show="menu.show" :style="\`top: \${menu.y}px; left: \${menu.x}px\`" class="context-menu" @click.outside="closeMenu()" x-cloak>
@@ -1473,6 +1506,20 @@ async function resolveTurnstile(env) {
 }
 function maskKey(k) { return k ? String(k).slice(0, 6) + '••••••••' + String(k).slice(-4) : ''; }
 
+// 🟢 Google AdSense：发布商 ID 与广告单元 ID 全部通过环境变量注入，零代码改动即可开关。
+// 设置方式（任选其一）：
+//   wrangler secret put AD_CLIENT_ID        # 推荐，加密存储（对应 Cloudflare 控制台 Variables and Secrets）
+//   或在 wrangler.toml 里写 [vars] AD_CLIENT_ID = "ca-pub-..."
+// 未配置 AD_CLIENT_ID 时，整站不渲染任何广告代码，不影响其它功能。
+function resolveAds(env) {
+    const clientId = (env.AD_CLIENT_ID || env.ADS_CLIENT_ID || '').toString().trim();
+    return {
+        clientId,
+        topSlot: (env.AD_TOP_SLOT || 'YOUR_TOP_AD_SLOT_ID').toString().trim(),
+        bottomSlot: (env.AD_BOTTOM_SLOT || 'YOUR_BOTTOM_AD_SLOT_ID').toString().trim(),
+    };
+}
+
 async function callSiteVerify(secretKey, token, ip) {
     const fd = new FormData();
     fd.append('secret', secretKey);
@@ -1609,7 +1656,8 @@ export default {
                 const coords = { lat: request.cf?.latitude || null, lon: request.cf?.longitude || null };
                 const ts = await resolveTurnstile(env);
                 const turnstile = { enabled: ts.enabled, siteKey: ts.enabled ? ts.siteKey : '', mode: ts.mode };
-                return new Response(HTML_TEMPLATE({ coords, turnstile }), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-cache" } });
+                const ads = resolveAds(env);
+                return new Response(HTML_TEMPLATE({ coords, turnstile, ads }), { headers: { "Content-Type": "text/html;charset=UTF-8", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-cache" } });
             }
             
             // --- R2 Storage Handlers ---
